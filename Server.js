@@ -1,535 +1,717 @@
 // ================================================================
-//  OmniHub TMA — Express + WebSocket Backend
-//  File: backend/src/server.js
-//
-//  Covers:
-//    1. Telegram initData verification (HMAC-SHA256)
-//    2. Auth middleware — every request validated against Telegram
-//    3. REST routes  — /auth/telegram, /wallet, /coins, /loans
-//    4. WebSocket Bingo Engine — real-time ball drops + win validation
-//    5. PostgreSQL integration (uses schema from Step 1)
+//  OmniHub — server.js
+//  Complete Production Backend
+//  Version: 2.0 — CORS fix + race condition fix included
 // ================================================================
 
-import express        from "express";
-import { createServer } from "http";
-import { WebSocketServer } from "ws";
-import pg             from "pg";
-import crypto         from "crypto";
-import cors           from "cors";
-import helmet         from "helmet";
-import rateLimit      from "express-rate-limit";
+require('dotenv').config();
+
+const express    = require('express');
+const http       = require('http');
+const { Server } = require('socket.io');
+const { Pool }   = require('pg');
+const jwt        = require('jsonwebtoken');
+const crypto     = require('crypto');
+const cors       = require('cors');
+
+// ── Route imports ────────────────────────────────────────────────
+const { registerAICronJobs } = require('./ai/AIAssistant');
+const authRoutes    = require('./routes/authRoutes');
+const paymentRoutes = require('./routes/paymentRoutes');
+const webhookRoutes = require('./webhook/webhookRoutes');
+const aiRoutes      = require('./ai/aiRoutes');
+const kycRoutes     = require('./routes/kycRoutes');
+
+const app    = express();
+const server = http.createServer(app);
+
+// ================================================================
+//  CORS — explicit origins (fix for browser security errors)
+// ================================================================
+const ALLOWED_ORIGINS = [
+  'https://omnihub.vercel.app',
+  'https://omnihub-frontend.vercel.app',
+  'http://localhost:5173',
+  'http://localhost:3000',
+  'http://127.0.0.1:5173',
+];
+
+app.use(cors({
+  origin: (origin, callback) => {
+    // Allow requests with no origin (mobile apps, curl, Postman)
+    if (!origin) return callback(null, true);
+    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+    callback(new Error(`CORS blocked: ${origin}`));
+  },
+  credentials:  true,
+  methods:      ['GET','POST','PUT','DELETE','OPTIONS'],
+  allowedHeaders:['Content-Type','Authorization','x-admin-key'],
+}));
+
+app.use(express.json({ limit: '1mb' }));
+
+// ── Mount feature routes ───────────────────────────────────────────
+// NOTE: webhook routes must stay public (no auth) — providers call these directly.
+app.use('/api/auth',    authRoutes);
+app.use('/api/payment', paymentRoutes);
+app.use('/webhook',     webhookRoutes);
+app.use('/api/ai',      aiRoutes);
+app.use('/api/kyc',     kycRoutes);   // user-facing KYC submit/status
+app.use('/',            kycRoutes);   // also exposes /admin/kyc/* routes
+
+// ── Socket.io with matching CORS ──────────────────────────────────
+const io = new Server(server, {
+  cors: {
+    origin:      ALLOWED_ORIGINS,
+    methods:     ['GET','POST'],
+    credentials: true,
+  },
+  pingInterval: 10000,
+  pingTimeout:  25000,
+});
 
 // ── Config ────────────────────────────────────────────────────────
-const PORT     = process.env.PORT ?? 4000;
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? "YOUR_BOT_TOKEN";
-const pool     = new pg.Pool({ connectionString: process.env.DATABASE_URL });
+const PORT       = process.env.PORT       || 3001;
+const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret_change_me';
+const ADMIN_PASS = process.env.ADMIN_PASS || 'OMNI_ADMIN_2026';
 
-// ================================================================
-//  1.  TELEGRAM initData VERIFICATION
-//     Spec: https://core.telegram.org/bots/webapps#validating-data
-// ================================================================
-function verifyTelegramInitData(initData) {
-  if (!initData || initData === "dev") {
-    // Allow dev/test mode when BOT_TOKEN is placeholder
-    return BOT_TOKEN === "YOUR_BOT_TOKEN"
-      ? { id: 0, first_name: "Dev", username: "dev_user" }
-      : null;
-  }
+// ── Database ──────────────────────────────────────────────────────
+const db = process.env.DATABASE_URL
+  ? new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: process.env.NODE_ENV === 'production'
+        ? { rejectUnauthorized: false }
+        : false,
+      max: 20,
+      idleTimeoutMillis: 30000,
+    })
+  : null;
 
-  try {
-    const params  = new URLSearchParams(initData);
-    const hash    = params.get("hash");
-    params.delete("hash");
-
-    // Sort params and build data-check-string
-    const dataCheckString = [...params.entries()]
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([k, v]) => `${k}=${v}`)
-      .join("\n");
-
-    // HMAC-SHA256: key = HMAC-SHA256("WebAppData", bot_token)
-    const secretKey = crypto
-      .createHmac("sha256", "WebAppData")
-      .update(BOT_TOKEN)
-      .digest();
-
-    const expectedHash = crypto
-      .createHmac("sha256", secretKey)
-      .update(dataCheckString)
-      .digest("hex");
-
-    if (expectedHash !== hash) return null;
-
-    // Parse and return user object
-    const user = JSON.parse(params.get("user") ?? "{}");
-    return user;
-  } catch {
-    return null;
-  }
+async function dbQuery(sql, params = []) {
+  if (!db) return { rows: [] };
+  return db.query(sql, params);
 }
 
 // ================================================================
-//  2.  AUTH MIDDLEWARE
+//  BINGO CONSTANTS
 // ================================================================
-function telegramAuth(req, res, next) {
-  const initData = req.headers["x-telegram-init-data"];
+const GRACE_PERIOD_MS  = 30000;
+const BALL_INTERVAL_MS = 4000;
+const BUY_IN_COINS     = 100;
+const BINGO_COLS       = ['B','I','N','G','O'];
+const FREE_BIT         = 12;
 
-  if (!initData) {
-    return res.status(401).json({ error: "Missing Telegram init data" });
-  }
+const WIN_MASKS = [
+  0b00000_00000_00000_00000_11111,
+  0b00000_00000_00000_11111_00000,
+  0b00000_00000_11111_00000_00000,
+  0b00000_11111_00000_00000_00000,
+  0b11111_00000_00000_00000_00000,
+  0b00001_00001_00001_00001_00001,
+  0b00010_00010_00010_00010_00010,
+  0b00100_00100_00100_00100_00100,
+  0b01000_01000_01000_01000_01000,
+  0b10000_10000_10000_10000_10000,
+  0b10000_01000_00100_00010_00001,
+  0b00001_00010_00100_01000_10000,
+];
 
-  const user = verifyTelegramInitData(initData);
-  if (!user || !user.id) {
-    return res.status(401).json({ error: "Invalid Telegram signature" });
-  }
+// ================================================================
+//  GAME STATE
+// ================================================================
+const gameState = {
+  isActive:     false,
+  drawnNumbers: [],
+  ballSequence: [],
+  drawIndex:    0,
+  ballSeed:     '',
+  prizePool:    0,
+  winner:       null,
+  ballInterval: null,
+  cdInterval:   null,
+  players:      new Map(),
+  // players Map: socketId → {
+  //   userId, username, socketId,
+  //   card,        ← { B:[],I:[],N:[],G:[],O:[] }
+  //   mask,        ← 25-bit server bitmask
+  //   status,      ← 'active' | 'disconnected'
+  //   dcTimer,
+  //   joinedAt,
+  //   refunded
+  // }
+};
 
-  req.tgUser = user;   // { id, first_name, last_name, username, language_code }
-  next();
+// ================================================================
+//  HELPERS
+// ================================================================
+
+function ballLetter(n) {
+  if (n <= 15) return 'B';
+  if (n <= 30) return 'I';
+  if (n <= 45) return 'N';
+  if (n <= 60) return 'G';
+  return 'O';
 }
 
-// ================================================================
-//  3.  USER / WALLET SERVICE  (DB helpers)
-// ================================================================
-const UserService = {
-  // Find existing user or auto-create from Telegram identity
-  async upsert(tgUser) {
-    const { rows: [user] } = await pool.query(
-      `INSERT INTO users
-         (username, email, password_hash, full_name, language, telegram_id,
-          kyc_status, is_active)
-       VALUES ($1, $2, $3, $4, $5, $6, 'pending', true)
-       ON CONFLICT (telegram_id) DO UPDATE
-         SET full_name     = EXCLUDED.full_name,
-             last_login_at = NOW()
-       RETURNING *`,
-      [
-        tgUser.username ?? `tg_${tgUser.id}`,
-        `tg_${tgUser.id}@telegram.local`,  // placeholder — no real email needed
-        crypto.randomBytes(32).toString("hex"),  // no password for TMA users
-        `${tgUser.first_name ?? ""} ${tgUser.last_name ?? ""}`.trim(),
-        tgUser.language_code ?? "am",
-        tgUser.id,
-      ]
-    );
-    return user;
-  },
-
-  async getDashboard(userId) {
-    const { rows: [data] } = await pool.query(
-      `SELECT * FROM v_user_dashboard WHERE id = $1`, [userId]
-    );
-    return data;
-  },
-};
-
-const WalletService = {
-  async getBalance(userId) {
-    const { rows: [w] } = await pool.query(
-      `SELECT balance_etb, balance_usd, coin_balance
-       FROM wallets WHERE user_id = $1`, [userId]
-    );
-    return w ?? { balance_etb: 0, balance_usd: 0, coin_balance: 0 };
-  },
-
-  async getRecentTxns(userId, limit = 10) {
-    const { rows } = await pool.query(
-      `SELECT le.* FROM ledger_entries le
-       JOIN wallets w ON w.id = le.wallet_id
-       WHERE w.user_id = $1
-       ORDER BY le.created_at DESC
-       LIMIT $2`,
-      [userId, limit]
-    );
-    return rows;
-  },
-};
-
-// ================================================================
-//  4.  EXPRESS APP
-// ================================================================
-const app    = express();
-const server = createServer(app);
-
-app.use(cors({ origin: process.env.FRONTEND_URL ?? "*" }));
-app.use(helmet());
-app.use(express.json());
-app.use(rateLimit({ windowMs: 60_000, max: 120 })); // 120 req/min
-
-// ── Health check (no auth) ────────────────────────────────────────
-app.get("/health", (_, res) => res.json({ ok: true, ts: Date.now() }));
-
-// ────────────────────────────────────────────────────────────────
-//  POST /api/auth/telegram
-//  Exchange Telegram initData for a session profile.
-//  The TMA doesn't need a traditional JWT — initData IS the token.
-// ────────────────────────────────────────────────────────────────
-app.post("/api/auth/telegram", telegramAuth, async (req, res) => {
-  try {
-    const dbUser = await UserService.upsert(req.tgUser);
-
-    // Award daily login coins (non-blocking)
-    awardDailyLogin(dbUser.id).catch(console.error);
-
-    const dashboard = await UserService.getDashboard(dbUser.id);
-    res.json({ user: dashboard, tgUser: req.tgUser });
-  } catch (err) {
-    console.error("[auth/telegram]", err.message);
-    res.status(500).json({ error: "Server error" });
+function generateBallSequence(seed) {
+  const balls = Array.from({ length: 75 }, (_, i) => i + 1);
+  for (let i = 74; i > 0; i--) {
+    const j = crypto
+      .createHmac('sha256', seed)
+      .update(`ball_${i}`)
+      .digest()
+      .readUInt32BE(0) % (i + 1);
+    [balls[i], balls[j]] = [balls[j], balls[i]];
   }
-});
+  return balls;
+}
 
-// ────────────────────────────────────────────────────────────────
-//  GET /api/wallet
-// ────────────────────────────────────────────────────────────────
-app.get("/api/wallet", telegramAuth, async (req, res) => {
-  try {
-    const dbUser  = await UserService.upsert(req.tgUser);
-    const balance = await WalletService.getBalance(dbUser.id);
-    const txns    = await WalletService.getRecentTxns(dbUser.id);
-    res.json({ balance, transactions: txns });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+function generateCard(seed) {
+  const ranges = {
+    B:[1,15], I:[16,30], N:[31,45], G:[46,60], O:[61,75],
+  };
+  const columns = {};
+  BINGO_COLS.forEach((col, ci) => {
+    const [min, max] = ranges[col];
+    const pool = Array.from({ length: max - min + 1 }, (_, i) => i + min);
+    for (let i = pool.length - 1; i > 0; i--) {
+      const j = crypto
+        .createHmac('sha256', seed)
+        .update(`${col}_${i}`)
+        .digest()
+        .readUInt32BE(0) % (i + 1);
+      [pool[i], pool[j]] = [pool[j], pool[i]];
+    }
+    columns[col] = pool.slice(0, 5);
+  });
+  columns.N[2] = 'FREE';
+  return columns;
+}
 
-// ────────────────────────────────────────────────────────────────
-//  GET /api/trust
-// ────────────────────────────────────────────────────────────────
-app.get("/api/trust", telegramAuth, async (req, res) => {
-  try {
-    const dbUser = await UserService.upsert(req.tgUser);
-    await pool.query(`SELECT fn_calculate_trust_score($1)`, [dbUser.id]);
-    const { rows: [ts] } = await pool.query(
-      `SELECT * FROM trust_scores WHERE user_id = $1`, [dbUser.id]
-    );
-    res.json(ts ?? { score: 0, max_loan_etb: 0, interest_rate_pct: 20 });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ────────────────────────────────────────────────────────────────
-//  POST /api/loans/apply
-// ────────────────────────────────────────────────────────────────
-app.post("/api/loans/apply", telegramAuth, async (req, res) => {
-  try {
-    const dbUser   = await UserService.upsert(req.tgUser);
-    const { amount, currency = "ETB", term_days = 30 } = req.body;
-
-    if (!amount || amount <= 0)
-      return res.status(400).json({ error: "Invalid amount" });
-
-    // Get trust score
-    const { rows: [ts] } = await pool.query(
-      `SELECT * FROM trust_scores WHERE user_id = $1`, [dbUser.id]
-    );
-    if (!ts || ts.score < 50)
-      return res.status(400).json({ error: "Trust score too low (min 50)" });
-    if (amount > ts.max_loan_etb)
-      return res.status(400).json({ error: `Max eligible: ETB ${ts.max_loan_etb}` });
-
-    const autoApprove = ts.score >= 60;
-    const dueAt = new Date();
-    dueAt.setDate(dueAt.getDate() + term_days);
-
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
-      const { rows: [loan] } = await client.query(
-        `INSERT INTO loans
-           (user_id, amount, currency, interest_rate_pct, term_days,
-            status, trust_score_snap, disbursed_at, due_at, auto_approved)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
-        [dbUser.id, amount, currency, ts.interest_rate_pct, term_days,
-         autoApprove ? "active" : "pending", ts.score,
-         autoApprove ? new Date() : null,
-         autoApprove ? dueAt : null, autoApprove]
-      );
-
-      if (autoApprove) {
-        const col = currency === "ETB" ? "balance_etb" : "balance_usd";
-        await client.query(
-          `UPDATE wallets SET ${col} = ${col} + $1 WHERE user_id = $2`,
-          [amount, dbUser.id]
-        );
+function buildMask(cardColumns, calledSet) {
+  let mask = 1 << FREE_BIT;
+  BINGO_COLS.forEach((col, ci) => {
+    cardColumns[col]?.forEach((val, row) => {
+      if (val !== 'FREE' && calledSet.has(val)) {
+        mask |= (1 << (ci * 5 + row));
       }
-      await client.query("COMMIT");
-      res.json({ loan, autoApproved: autoApprove, trustScore: ts.score });
-    } catch (e) {
-      await client.query("ROLLBACK"); throw e;
-    } finally { client.release(); }
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ────────────────────────────────────────────────────────────────
-//  Coin award helper
-// ────────────────────────────────────────────────────────────────
-async function awardDailyLogin(userId) {
-  const today   = new Date().toISOString().slice(0, 10);
-  const { rows: [user] } = await pool.query(
-    `UPDATE users
-        SET login_streak = CASE
-              WHEN last_login_at > NOW() - INTERVAL '48 hours' THEN login_streak + 1
-              ELSE 1
-            END,
-            last_login_at = NOW()
-      WHERE id = $1
-      RETURNING login_streak`,
-    [userId]
-  );
-
-  const streakBonus = Math.floor((user?.login_streak ?? 0) / 7) * 5;
-  const coins       = 10 + streakBonus;
-
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    const { rows: [w] } = await client.query(
-      `UPDATE wallets SET coin_balance = coin_balance + $1
-       WHERE user_id = $2 RETURNING coin_balance`, [coins, userId]
-    );
-    await client.query(
-      `INSERT INTO coin_transactions (user_id,rule_key,coins,balance_after,description)
-       VALUES ($1,'daily_login',$2,$3,$4)`,
-      [userId, coins, w.coin_balance, `Daily login +${coins} (streak ${user?.login_streak})`]
-    );
-    await client.query("COMMIT");
-  } catch { await client.query("ROLLBACK"); }
-  finally  { client.release(); }
-}
-
-// ================================================================
-//  5.  WEBSOCKET BINGO ENGINE
-//     Path: ws://host:4000/bingo/:roomId
-// ================================================================
-const wss = new WebSocketServer({ server, path: "/" });
-
-// In-memory room state (upgrade to Redis for multi-server)
-const rooms = new Map();
-// rooms.get(roomId) = {
-//   clients:  Set<WebSocket>,
-//   called:   number[],
-//   status:   "waiting"|"active"|"completed",
-//   interval: NodeJS.Timer | null,
-//   prizePool: number,
-// }
-
-function getOrCreateRoom(roomId) {
-  if (!rooms.has(roomId)) {
-    rooms.set(roomId, {
-      clients:   new Set(),
-      called:    [],
-      status:    "waiting",
-      interval:  null,
-      prizePool: 0,
     });
-
-    // Persist the room row so drawBall()'s UPDATE has something to affect.
-    pool.query(
-      `INSERT INTO bingo_rooms (room_code, status)
-       VALUES ($1, 'waiting')
-       ON CONFLICT (room_code) DO NOTHING`,
-      [roomId]
-    ).catch(err => console.error('[bingo_rooms create]', err.message));
-  }
-  return rooms.get(roomId);
+  });
+  return mask;
 }
 
-function broadcast(room, message) {
-  const data = JSON.stringify(message);
-  for (const client of room.clients) {
-    if (client.readyState === 1 /* OPEN */) client.send(data);
+function checkWin(mask) {
+  return WIN_MASKS.some(pm => (mask & pm) === pm);
+}
+
+// ── Update one player's bitmask when a ball is drawn ─────────────
+function updatePlayerMask(player, ball) {
+  BINGO_COLS.forEach((col, ci) => {
+    player.card[col]?.forEach((val, row) => {
+      if (val === ball) {
+        player.mask |= (1 << (ci * 5 + row));
+      }
+    });
+  });
+}
+
+async function awardCoins(userId, amount, description) {
+  try {
+    await dbQuery(
+      `UPDATE wallets SET coin_balance = coin_balance + $1 WHERE user_id = $2`,
+      [amount, userId]
+    );
+    await dbQuery(
+      `INSERT INTO coin_transactions
+         (user_id, rule_key, coins, balance_after, description)
+       SELECT $1, 'bingo_win', $2, coin_balance, $3
+       FROM wallets WHERE user_id = $1`,
+      [userId, amount, description]
+    );
+  } catch (err) {
+    console.error('[awardCoins]', err.message);
   }
 }
 
-// Draw one ball — server-authoritative, cryptographically random
-function drawBall(roomId) {
-  const room = rooms.get(roomId);
-  if (!room) return;
+async function refundCoins(userId, amount) {
+  try {
+    await dbQuery(
+      `UPDATE wallets SET coin_balance = coin_balance + $1 WHERE user_id = $2`,
+      [amount, userId]
+    );
+    await dbQuery(
+      `INSERT INTO coin_transactions
+         (user_id, rule_key, coins, balance_after, description)
+       SELECT $1, 'refund', $2, coin_balance,
+              'Bingo refund — disconnected before game started'
+       FROM wallets WHERE user_id = $1`,
+      [userId, amount]
+    );
+  } catch (err) {
+    console.error('[refundCoins]', err.message);
+  }
+}
 
-  const maxBall  = 75;
-  const remaining = [];
-  const calledSet = new Set(room.called);
-  for (let i = 1; i <= maxBall; i++) if (!calledSet.has(i)) remaining.push(i);
+// ================================================================
+//  GAME FUNCTIONS
+// ================================================================
 
-  if (!remaining.length) {
-    // All balls drawn — game over
-    clearInterval(room.interval);
-    room.status   = "completed";
-    room.interval = null;
-    broadcast(room, { type: "game_over", called: room.called });
+function drawNextBall() {
+  if (gameState.drawIndex >= gameState.ballSequence.length) {
+    endGame('all_balls_drawn');
     return;
   }
 
-  // Cryptographically fair selection
-  const buf = crypto.randomBytes(4);
-  const idx = buf.readUInt32BE(0) % remaining.length;
-  const num = remaining[idx];
+  const ball = gameState.ballSequence[gameState.drawIndex++];
+  gameState.drawnNumbers.push(ball);
 
-  room.called.push(num);
-
-  // Persist to DB (non-blocking)
-  pool.query(
-    `UPDATE bingo_rooms
-       SET called_numbers = array_append(called_numbers, $1)
-     WHERE room_code = $2`,
-    [num, roomId]
-  ).catch(console.error);
-
-  broadcast(room, {
-    type:   "ball_drawn",
-    number: num,
-    total:  room.called.length,
-    called: room.called,
+  // Update every active player's server bitmask
+  gameState.players.forEach(player => {
+    if (player.status === 'active') {
+      updatePlayerMask(player, ball);
+    }
   });
+
+  io.emit('new_number', {
+    number:      ball,
+    letter:      ballLetter(ball),
+    called:      gameState.drawnNumbers,
+    totalCalled: gameState.drawnNumbers.length,
+  });
+
+  console.log(`[Ball] ${ballLetter(ball)}-${ball} | Total: ${gameState.drawnNumbers.length}`);
 }
 
-// Validate a win claim from a client
-function validateWinClaim(card, called, pattern = "any_line") {
-  const s = new Set(called);
-  const m = (col, row) => (col === 2 && row === 2) || s.has(card[col][row]);
+function startBingoRound() {
+  if (gameState.isActive) return;
 
-  if (pattern === "full_house")
-    return [0,1,2,3,4].every(c => [0,1,2,3,4].every(r => m(c,r)));
+  gameState.ballSeed     = crypto.randomBytes(32).toString('hex');
+  gameState.ballSequence = generateBallSequence(gameState.ballSeed);
+  gameState.drawnNumbers = [];
+  gameState.drawIndex    = 0;
+  gameState.isActive     = true;
+  gameState.winner       = null;
+  gameState.prizePool    = gameState.players.size * BUY_IN_COINS * 0.9;
 
-  // Check rows
-  for (let r = 0; r < 5; r++)
-    if ([0,1,2,3,4].every(c => m(c,r))) return true;
-  // Check cols
-  for (let c = 0; c < 5; c++)
-    if ([0,1,2,3,4].every(r => m(c,r))) return true;
-  // Check diagonals
-  if ([0,1,2,3,4].every(i => m(i,i))) return true;
-  if ([0,1,2,3,4].every(i => m(i,4-i))) return true;
+  io.emit('game_started', {
+    message:     '🎯 ቢንጎ ጀምሯል!',
+    playerCount: gameState.players.size,
+    prizePool:   gameState.prizePool,
+    ballSeed:    gameState.ballSeed,
+  });
 
-  return false;
+  console.log(`[Game] Started | Players: ${gameState.players.size} | Prize: ${gameState.prizePool}`);
+  gameState.ballInterval = setInterval(drawNextBall, BALL_INTERVAL_MS);
 }
 
-wss.on("connection", (ws, req) => {
-  // Extract roomId from URL: /bingo/room_001
-  const roomId = req.url.replace(/^\/bingo\//, "") || "room_001";
-  const room   = getOrCreateRoom(roomId);
+function endGame(reason) {
+  clearInterval(gameState.ballInterval);
+  gameState.ballInterval = null;
+  gameState.isActive     = false;
 
-  room.clients.add(ws);
-  let userId = null;
-  let userCard = null;
+  io.emit('game_over', {
+    reason,
+    winner:     gameState.winner,
+    prizePool:  gameState.prizePool,
+    totalDrawn: gameState.drawnNumbers.length,
+    message:    gameState.winner
+      ? `🏆 ${gameState.winner.username} won!`
+      : '😔 No winner this round.',
+  });
 
-  // Send current state to new joiner
-  ws.send(JSON.stringify({
-    type:    "welcome",
-    roomId,
-    status:  room.status,
-    called:  room.called,
-    players: room.clients.size,
-  }));
+  console.log(`[Game] Over — ${reason} | Winner: ${gameState.winner?.username ?? 'none'}`);
 
-  broadcast(room, { type: "room_update", players: room.clients.size, prize_pool: room.prizePool });
+  // Log this round to the database for reporting (non-blocking — never crash the game loop)
+  dbQuery(
+    `INSERT INTO bingo_rounds
+       (winner_user_id, player_count, prize_pool_coins, prize_etb, balls_drawn, end_reason)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [
+      gameState.winner?.userId ?? null,
+      gameState.players.size,
+      gameState.prizePool,
+      gameState.winner?.etbPrize ?? 0,
+      gameState.drawnNumbers.length,
+      reason,
+    ]
+  ).catch(err => console.error('[bingo_rounds log]', err.message));
+}
 
-  ws.on("message", async (raw) => {
-    let msg;
-    try { msg = JSON.parse(raw); } catch { return; }
+function startCountdown() {
+  let count = 5;
+  gameState.cdInterval = setInterval(() => {
+    io.emit('countdown', { seconds: count });
+    count--;
+    if (count < 0) {
+      clearInterval(gameState.cdInterval);
+      gameState.cdInterval = null;
+      startBingoRound();
+    }
+  }, 1000);
+}
 
-    switch (msg.type) {
+// ================================================================
+//  SOCKET.IO
+// ================================================================
+io.on('connection', socket => {
+  console.log(`[Socket] Connected: ${socket.id}`);
 
-      // ── Client authenticates via Telegram initData ────────────
-      case "auth": {
-        const tgUser = verifyTelegramInitData(msg.initData);
-        if (!tgUser) { ws.send(JSON.stringify({ type: "error", message: "Auth failed" })); return; }
-        userId = tgUser.id;
-        ws.send(JSON.stringify({ type: "auth_ok", userId }));
-        break;
+  // ── join_game ────────────────────────────────────────────────
+  socket.on('join_game', async userData => {
+    const { userId, username } = userData || {};
+    if (!userId || !username) {
+      return socket.emit('error', { message: 'userId and username required' });
+    }
+
+    // ── Check for reconnect (same userId exists in players map) ──
+    let existingPlayer = null;
+    gameState.players.forEach(p => {
+      if (p.userId === userId) existingPlayer = p;
+    });
+
+    if (existingPlayer) {
+      // ── RECONNECT PATH ──────────────────────────────────────
+      console.log(`[Reconnect] ${username}`);
+
+      // Cancel grace period timer
+      if (existingPlayer.dcTimer) {
+        clearTimeout(existingPlayer.dcTimer);
+        existingPlayer.dcTimer = null;
       }
 
-      // ── Client buys in and joins the game ─────────────────────
-      case "join_game": {
-        if (!userId) return;
-        room.prizePool += msg.buy_in ?? 50;
+      // Swap socket reference
+      gameState.players.delete(existingPlayer.socketId);
+      existingPlayer.socketId = socket.id;
+      existingPlayer.status   = 'active';
+      gameState.players.set(socket.id, existingPlayer);
 
-        // Start draw loop when ≥2 players (or after 10s for demo)
-        if (room.status === "waiting") {
-          room.status = "active";
-          broadcast(room, { type: "game_started", players: room.clients.size });
+      // Send full current state so client can catch up
+      // ── NOTE: card is sent here so client cardRef can be updated ──
+      socket.emit('reconnected', {
+        message:      '🔄 ተመልሰዋል! Reconnected.',
+        isActive:     gameState.isActive,
+        drawnNumbers: gameState.drawnNumbers,
+        prizePool:    gameState.prizePool,
+        playerCount:  gameState.players.size,
+        yourCard:     existingPlayer.card,   // ← client updates cardRef here
+        yourMask:     existingPlayer.mask,
+      });
 
-          // Draw a ball every 4 seconds
-          room.interval = setInterval(() => drawBall(roomId), 4000);
+      io.emit('player_count', gameState.players.size);
+      io.emit('player_reconnected', {
+        username,
+        playerCount: gameState.players.size,
+        message: `✅ ${username} ተመልሷል!`,
+      });
 
-          // Also draw immediately
-          setTimeout(() => drawBall(roomId), 500);
-        }
+    } else {
+      // ── NEW JOIN PATH ────────────────────────────────────────
 
-        ws.send(JSON.stringify({ type: "joined", roomId, prizePool: room.prizePool }));
-        broadcast(room, { type: "room_update", players: room.clients.size, prize_pool: room.prizePool });
-        break;
+      // Deduct buy-in coins from wallet
+      const { rows: [wallet] } = await dbQuery(
+        `UPDATE wallets
+           SET coin_balance = coin_balance - $1
+         WHERE user_id = $2
+           AND coin_balance >= $1
+         RETURNING coin_balance`,
+        [BUY_IN_COINS, userId]
+      );
+
+      if (process.env.DATABASE_URL && !wallet) {
+        return socket.emit('error', {
+          message: `Need ${BUY_IN_COINS} OmniCoins to join`,
+        });
       }
 
-      // ── Client sends their card (for server-side win checking) ─
-      case "register_card": {
-        userCard = msg.card;  // 5×5 array[col][row]
-        break;
-      }
+      // Generate card with crypto seed
+      const card = generateCard(`${userId}_${Date.now()}`);
 
-      // ── Client claims BINGO ────────────────────────────────────
-      case "claim_win": {
-        if (!userCard || !userId) return;
+      const playerEntry = {
+        userId,
+        username,
+        socketId: socket.id,
+        card,                       // { B:[],I:[],N:[],G:[],O:[] }
+        mask:     1 << FREE_BIT,    // FREE center always marked
+        status:   'active',
+        dcTimer:  null,
+        joinedAt: Date.now(),
+        refunded: false,
+      };
 
-        const valid = validateWinClaim(userCard, room.called, msg.pattern);
-        if (valid) {
-          clearInterval(room.interval);
-          room.status = "completed";
+      gameState.players.set(socket.id, playerEntry);
 
-          const winnerEtb = +(room.prizePool * 0.9).toFixed(2);
+      socket.emit('joined', {
+        message:     `ተቀላቀሉ! ${username}`,
+        card,                        // ← client stores in cardRef
+        buyIn:       BUY_IN_COINS,
+        coinBalance: wallet?.coin_balance ?? 'N/A',
+        playerCount: gameState.players.size,
+      });
 
-          // Resolve the actual DB user id once (set during "auth"), then credit directly —
-          // avoids the fragile/unsafe username-or-email LIKE pattern-match used previously.
-          UserService.upsert({ id: userId })
-            .then(dbUser => {
-              const client = pool;
-              return client.query(
-                `UPDATE wallets
-                   SET balance_etb  = balance_etb + $1,
-                       coin_balance = coin_balance + 100
-                 WHERE user_id = $2`,
-                [winnerEtb, dbUser.id]
-              );
-            })
-            .catch(err => console.error('[claim_win credit]', err.message));
+      io.emit('player_count', gameState.players.size);
+      console.log(`[Join] ${username} | Players: ${gameState.players.size}`);
 
-          ws.send(JSON.stringify({ type: "win_confirmed", prize: winnerEtb }));
-          broadcast(room, { type: "game_over", winner: userId, called: room.called });
-        } else {
-          ws.send(JSON.stringify({ type: "win_rejected", reason: "Invalid claim" }));
-        }
-        break;
+      // Auto-start countdown when 2+ players
+      if (
+        gameState.players.size >= 2 &&
+        !gameState.isActive &&
+        !gameState.cdInterval
+      ) {
+        startCountdown();
       }
     }
   });
 
-  ws.on("close", () => {
-    room.clients.delete(ws);
-    broadcast(room, { type: "room_update", players: room.clients.size, prize_pool: room.prizePool });
-    // Clean up empty room
-    if (room.clients.size === 0 && room.interval) {
-      clearInterval(room.interval);
-      rooms.delete(roomId);
+  // ── claim_bingo ──────────────────────────────────────────────
+  socket.on('claim_bingo', async () => {
+    if (!gameState.isActive) {
+      return socket.emit('claim_rejected', { reason: 'no_active_game' });
     }
+
+    const player = gameState.players.get(socket.id);
+    if (!player || player.status !== 'active') {
+      return socket.emit('claim_rejected', { reason: 'player_not_found' });
+    }
+
+    // ── Layer 1: server bitmask check ────────────────────────
+    const primaryWin = checkWin(player.mask);
+
+    // ── Layer 2: recompute from scratch (anti-cheat) ─────────
+    const recomputed   = buildMask(player.card, new Set(gameState.drawnNumbers));
+    const secondaryWin = checkWin(recomputed);
+
+    if (!primaryWin || !secondaryWin) {
+      console.log(`[Claim Rejected] ${player.username}`);
+      return socket.emit('claim_rejected', {
+        reason:  'no_winning_pattern',
+        message: '❌ ቢንጎ አይደለም — ቀጥሉ!',
+      });
+    }
+
+    // ── Valid win ────────────────────────────────────────────
+    clearInterval(gameState.ballInterval);
+
+    const coinPrize = gameState.prizePool;
+    const etbPrize  = parseFloat((coinPrize * 0.05).toFixed(2));
+
+    await awardCoins(
+      player.userId,
+      coinPrize,
+      `Bingo win — ${gameState.drawnNumbers.length} balls drawn`
+    );
+    await dbQuery(
+      `UPDATE wallets SET balance_etb = balance_etb + $1 WHERE user_id = $2`,
+      [etbPrize, player.userId]
+    );
+
+    gameState.winner = {
+      userId:    player.userId,
+      username:  player.username,
+      coinPrize,
+      etbPrize,
+    };
+
+    endGame('winner');
   });
 
-  ws.on("error", (err) => console.error(`[WS] Error (room ${roomId}):`, err.message));
+  // ── admin_start_round ────────────────────────────────────────
+  socket.on('admin_start_round', pass => {
+    if (pass !== ADMIN_PASS) {
+      return socket.emit('error', { message: 'Invalid admin password' });
+    }
+    if (gameState.isActive) {
+      return socket.emit('admin_ack', { ok: false, message: 'Already running' });
+    }
+    io.emit('admin_action', {
+      action:  'force_start',
+      message: '🔧 Admin ጨዋታ ጀምሯል!',
+    });
+    startBingoRound();
+    socket.emit('admin_ack', {
+      ok:          true,
+      message:     'Round started',
+      playerCount: gameState.players.size,
+      prizePool:   gameState.prizePool,
+    });
+  });
+
+  // ── admin_stop_round ─────────────────────────────────────────
+  socket.on('admin_stop_round', pass => {
+    if (pass !== ADMIN_PASS) {
+      return socket.emit('error', { message: 'Invalid admin password' });
+    }
+    if (!gameState.isActive) {
+      return socket.emit('admin_ack', { ok: false, message: 'No game running' });
+    }
+    io.emit('admin_action', {
+      action:  'force_stop',
+      message: '🔧 Admin ጨዋታ አቆሟል!',
+    });
+    endGame('admin_stopped');
+    socket.emit('admin_ack', { ok: true, message: 'Stopped' });
+  });
+
+  // ── admin_get_state ──────────────────────────────────────────
+  socket.on('admin_get_state', pass => {
+    if (pass !== ADMIN_PASS) {
+      return socket.emit('error', { message: 'Invalid admin password' });
+    }
+    socket.emit('admin_state', {
+      isActive:     gameState.isActive,
+      drawnCount:   gameState.drawnNumbers.length,
+      drawnNumbers: gameState.drawnNumbers,
+      prizePool:    gameState.prizePool,
+      playerCount:  gameState.players.size,
+      players: [...gameState.players.values()].map(p => ({
+        username: p.username,
+        status:   p.status,
+        refunded: p.refunded,
+      })),
+    });
+  });
+
+  // ── chat ─────────────────────────────────────────────────────
+  socket.on('chat', ({ text }) => {
+    const player = gameState.players.get(socket.id);
+    if (!player || !text?.trim()) return;
+    io.emit('chat', {
+      username: player.username,
+      text:     text.trim().slice(0, 200),
+      ts:       Date.now(),
+    });
+  });
+
+  // ── keep-alive ───────────────────────────────────────────────
+  socket.on('ping_client',  () => socket.emit('pong_server'));
+  socket.on('pong_server',  () => { socket.isAlive = true; });
+
+  // ── disconnect — 30-second grace period ─────────────────────
+  socket.on('disconnect', reason => {
+    const player = gameState.players.get(socket.id);
+    if (!player) return;
+
+    player.status = 'disconnected';
+    console.log(`[DC] ${player.username} (${reason}) — grace ${GRACE_PERIOD_MS/1000}s`);
+
+    io.emit('player_disconnected', {
+      username:     player.username,
+      graceSeconds: GRACE_PERIOD_MS / 1000,
+      message:      `⚠️ ${player.username} ተቋርጧል — ${GRACE_PERIOD_MS/1000}s ለ reconnect`,
+      playerCount:  gameState.players.size,
+    });
+
+    player.dcTimer = setTimeout(async () => {
+      const current = gameState.players.get(socket.id);
+      if (!current || current.status !== 'disconnected') return;
+
+      // Refund buy-in if game hasn't started
+      if (!gameState.isActive && !current.refunded) {
+        await refundCoins(current.userId, BUY_IN_COINS);
+        current.refunded = true;
+      }
+
+      gameState.players.delete(socket.id);
+
+      io.emit('player_removed', {
+        username:    player.username,
+        playerCount: gameState.players.size,
+        message:     `${player.username} ሰዓቱ አልፏል — ወጥቷል`,
+      });
+
+      console.log(`[Grace Expired] ${player.username} removed`);
+
+      // End game if no active players remain
+      const activePlayers = [...gameState.players.values()]
+        .filter(p => p.status === 'active');
+      if (gameState.isActive && activePlayers.length === 0) {
+        endGame('all_players_disconnected');
+      }
+
+    }, GRACE_PERIOD_MS);
+  });
+});
+
+// ── Heartbeat — remove zombie sockets ────────────────────────────
+setInterval(() => {
+  io.sockets.sockets.forEach(s => {
+    if (s.isAlive === false) { s.disconnect(true); return; }
+    s.isAlive = false;
+    s.emit('server_ping');
+  });
+}, 30000);
+
+// ================================================================
+//  REST ENDPOINTS
+// ================================================================
+
+app.get('/health', (_req, res) => {
+  res.json({
+    status:   'ok',
+    uptime:   Math.floor(process.uptime()),
+    isActive: gameState.isActive,
+    players:  gameState.players.size,
+    services: {
+      database: !!db,
+      ai:       !!process.env.ANTHROPIC_API_KEY,
+      chapa:    !!process.env.CHAPA_SECRET_KEY,
+      telebirr: !!process.env.TELEBIRR_APP_ID,
+      cbebirr:  !!process.env.CBEBIRR_MERCHANT_ID,
+    },
+  });
+});
+
+app.get('/admin/state', (req, res) => {
+  if (req.headers['x-admin-key'] !== ADMIN_PASS) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  res.json({
+    isActive:    gameState.isActive,
+    drawnCount:  gameState.drawnNumbers.length,
+    prizePool:   gameState.prizePool,
+    playerCount: gameState.players.size,
+    players: [...gameState.players.values()].map(p => ({
+      username: p.username,
+      status:   p.status,
+      refunded: p.refunded,
+    })),
+  });
+});
+
+app.post('/admin/start', (req, res) => {
+  if (req.headers['x-admin-key'] !== ADMIN_PASS) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  if (gameState.isActive) {
+    return res.json({ ok: false, message: 'Already running' });
+  }
+  io.emit('admin_action', { action:'force_start', message:'🔧 Admin ጨዋታ ጀምሯል!' });
+  startBingoRound();
+  res.json({ ok: true, players: gameState.players.size, prizePool: gameState.prizePool });
+});
+
+app.post('/admin/stop', (req, res) => {
+  if (req.headers['x-admin-key'] !== ADMIN_PASS) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  if (!gameState.isActive) return res.json({ ok: false, message: 'No game running' });
+  endGame('admin_stopped');
+  res.json({ ok: true });
 });
 
 // ================================================================
 //  START
 // ================================================================
 server.listen(PORT, () => {
-  console.log(`
-  ╔══════════════════════════════════════╗
-  ║   OmniHub TMA Backend — Running      ║
-  ║   HTTP:  http://localhost:${PORT}       ║
-  ║   WS:    ws://localhost:${PORT}/bingo/* ║
-  ╚══════════════════════════════════════╝
-  `);
-});
+  console.log('');
+  console.log(`  ✅  OmniHub Server running on port ${PORT}`);
+  console.log(`  📡  Socket.io : ws://localhost:${PORT}`);
+  console.log(`  🔗  Health    : http://localhost:${PORT}/health`);
+  console.log(`  🔒  Admin     : http://localhost:${PORT}/admin/state`);
+  console.log(`  🌐  CORS OK   : ${ALLOWED_ORIGINS.join(', ')}`);
+  console.log('');
 
-export default app;
+  // Start AI cron jobs (daily summary, holiday rewards)
+  try { registerAICronJobs(); } catch (e) {
+    console.log('  ⚠️  AI cron skipped:', e.message);
+  }
+});
