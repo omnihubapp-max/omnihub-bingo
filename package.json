@@ -1,5 +1,4 @@
-const PKG_JSON =
-`{
+{
   "name": "omnihub-bingo",
   "version": "1.0.0",
   "description": "OmniHub Super App — Telegram Mini-App with Provably Fair 5x5 Bingo",
