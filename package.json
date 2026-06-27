@@ -1,1 +1,18 @@
-
+const PKG_JSON =
+`{
+  "name": "omnihub-bingo",
+  "version": "1.0.0",
+  "description": "OmniHub Super App — Telegram Mini-App with Provably Fair 5x5 Bingo",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "socket.io": "^4.7.5"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}`;
