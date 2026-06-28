@@ -1,151 +1,79 @@
-// ================================================================
-//  OmniHub — server.js
-//  Complete Production Backend
-//  Version: 2.0 — CORS fix + race condition fix included
-// ================================================================
+'use strict';
 
-require('dotenv').config();
+/**
+ * OmniHub Super App — server.js
+ * ─────────────────────────────────────────────────────────────
+ * Telegram Mini-App Backend: Dashboard + 5x5 Provably Fair Bingo
+ * Stack : Node.js + Express + Socket.IO
+ *
+ * Provably-fair protocol
+ * ──────────────────────
+ *  1. Before each round the server generates a random 32-byte
+ *     serverSeed and broadcasts only its SHA-256 hash (the
+ *     "commit"). Players cannot predict cards or calls from
+ *     the hash alone.
+ *  2. Cards and the call order are derived from serverSeed via
+ *     HMAC-SHA256-seeded Fisher-Yates (see generateCard /
+ *     generateCallSequence). Every swap folds col + index +
+ *     pool state into the HMAC, making each decision uniquely
+ *     verifiable.
+ *  3. After the round ends the server reveals the raw serverSeed
+ *     (the "reveal"). Anyone can recompute the cards and call
+ *     order and confirm they match exactly.
+ *
+ * Deploy (Render)
+ * ───────────────
+ *  Build Command : npm install
+ *  Start Command : node server.js
+ *  Env var       : TELEGRAM_BOT_TOKEN  (from @BotFather)
+ * ─────────────────────────────────────────────────────────────
+ */
 
-const express    = require('express');
-const http       = require('http');
-const { Server } = require('socket.io');
-const { Pool }   = require('pg');
-const jwt        = require('jsonwebtoken');
-const crypto     = require('crypto');
-const cors       = require('cors');
-
-// ── Route imports ────────────────────────────────────────────────
-const { registerAICronJobs } = require('./ai/AIAssistant');
-const authRoutes    = require('./routes/authRoutes');
-const paymentRoutes = require('./routes/paymentRoutes');
-const webhookRoutes = require('./webhook/webhookRoutes');
-const aiRoutes      = require('./ai/aiRoutes');
-const kycRoutes     = require('./routes/kycRoutes');
+const express        = require('express');
+const http           = require('http');
+const crypto         = require('crypto');
+const cors           = require('cors');
+const path           = require('path');
+const { Server }     = require('socket.io');
 
 const app    = express();
 const server = http.createServer(app);
-
-// ================================================================
-//  CORS — explicit origins (fix for browser security errors)
-// ================================================================
-const ALLOWED_ORIGINS = [
-  'https://omnihub.vercel.app',
-  'https://omnihub-frontend.vercel.app',
-  'http://localhost:5173',
-  'http://localhost:3000',
-  'http://127.0.0.1:5173',
-];
-
-app.use(cors({
-  origin: (origin, callback) => {
-    // Allow requests with no origin (mobile apps, curl, Postman)
-    if (!origin) return callback(null, true);
-    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
-    callback(new Error(`CORS blocked: ${origin}`));
-  },
-  credentials:  true,
-  methods:      ['GET','POST','PUT','DELETE','OPTIONS'],
-  allowedHeaders:['Content-Type','Authorization','x-admin-key'],
-}));
-
-app.use(express.json({ limit: '1mb' }));
-
-// ── Mount feature routes ───────────────────────────────────────────
-// NOTE: webhook routes must stay public (no auth) — providers call these directly.
-app.use('/api/auth',    authRoutes);
-app.use('/api/payment', paymentRoutes);
-app.use('/webhook',     webhookRoutes);
-app.use('/api/ai',      aiRoutes);
-app.use('/api/kyc',     kycRoutes);   // user-facing KYC submit/status
-app.use('/',            kycRoutes);   // also exposes /admin/kyc/* routes
-
-// ── Socket.io with matching CORS ──────────────────────────────────
-const io = new Server(server, {
-  cors: {
-    origin:      ALLOWED_ORIGINS,
-    methods:     ['GET','POST'],
-    credentials: true,
-  },
-  pingInterval: 10000,
-  pingTimeout:  25000,
+const io     = new Server(server, {
+  cors:       { origin: '*', methods: ['GET', 'POST'] },
+  transports: ['websocket', 'polling'],
 });
 
-// ── Config ────────────────────────────────────────────────────────
-const PORT       = process.env.PORT       || 3001;
-const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret_change_me';
-const ADMIN_PASS = process.env.ADMIN_PASS || 'OMNI_ADMIN_2026';
+// ── Config ────────────────────────────────────────────────────
+const PORT               = process.env.PORT || 3000;
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+const STARTING_BALANCE   = 1000;   // coins every new player starts with
+const ENTRY_FEE          = 50;     // coins to join one round
+const CALL_INTERVAL_MS   = 4000;   // milliseconds between each number call
+const COUNTDOWN_SECONDS  = 10;     // seconds before a round starts
+const MIN_PLAYERS        = 1;      // raise to 2+ for real multiplayer
 
-// ── Database ──────────────────────────────────────────────────────
-const db = process.env.DATABASE_URL
-  ? new Pool({
-      connectionString: process.env.DATABASE_URL,
-      ssl: process.env.NODE_ENV === 'production'
-        ? { rejectUnauthorized: false }
-        : false,
-      max: 20,
-      idleTimeoutMillis: 30000,
-    })
-  : null;
+// ── In-memory stores ──────────────────────────────────────────
+// Balances and rooms live in memory and reset on server restart.
+// Swap these two Maps for a real DB later — no game logic changes.
+const users = new Map();   // String(telegramId) → { id, name, balance }
+const rooms = new Map();   // roomId             → room object
 
-async function dbQuery(sql, params = []) {
-  if (!db) return { rows: [] };
-  return db.query(sql, params);
+// ── Express middleware ────────────────────────────────────────
+app.use(cors());
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Health-check endpoint — used by UptimeRobot to keep Render awake
+app.get('/health', function (_req, res) {
+  res.json({ status: 'ok', time: new Date().toISOString() });
+});
+
+// ── Utility functions ─────────────────────────────────────────
+function sha256(str) {
+  return crypto.createHash('sha256').update(str).digest('hex');
 }
 
-// ================================================================
-//  BINGO CONSTANTS
-// ================================================================
-const GRACE_PERIOD_MS  = 30000;
-const BALL_INTERVAL_MS = 4000;
-const BUY_IN_COINS     = 100;
-const BINGO_COLS       = ['B','I','N','G','O'];
-const FREE_BIT         = 12;
-
-const WIN_MASKS = [
-  0b00000_00000_00000_00000_11111,
-  0b00000_00000_00000_11111_00000,
-  0b00000_00000_11111_00000_00000,
-  0b00000_11111_00000_00000_00000,
-  0b11111_00000_00000_00000_00000,
-  0b00001_00001_00001_00001_00001,
-  0b00010_00010_00010_00010_00010,
-  0b00100_00100_00100_00100_00100,
-  0b01000_01000_01000_01000_01000,
-  0b10000_10000_10000_10000_10000,
-  0b10000_01000_00100_00010_00001,
-  0b00001_00010_00100_01000_10000,
-];
-
-// ================================================================
-//  GAME STATE
-// ================================================================
-const gameState = {
-  isActive:     false,
-  drawnNumbers: [],
-  ballSequence: [],
-  drawIndex:    0,
-  ballSeed:     '',
-  prizePool:    0,
-  winner:       null,
-  ballInterval: null,
-  cdInterval:   null,
-  players:      new Map(),
-  // players Map: socketId → {
-  //   userId, username, socketId,
-  //   card,        ← { B:[],I:[],N:[],G:[],O:[] }
-  //   mask,        ← 25-bit server bitmask
-  //   status,      ← 'active' | 'disconnected'
-  //   dcTimer,
-  //   joinedAt,
-  //   refunded
-  // }
-};
-
-// ================================================================
-//  HELPERS
-// ================================================================
-
-function ballLetter(n) {
+function letterForNumber(n) {
   if (n <= 15) return 'B';
   if (n <= 30) return 'I';
   if (n <= 45) return 'N';
@@ -153,565 +81,471 @@ function ballLetter(n) {
   return 'O';
 }
 
-function generateBallSequence(seed) {
-  const balls = Array.from({ length: 75 }, (_, i) => i + 1);
-  for (let i = 74; i > 0; i--) {
-    const j = crypto
-      .createHmac('sha256', seed)
-      .update(`ball_${i}`)
-      .digest()
-      .readUInt32BE(0) % (i + 1);
-    [balls[i], balls[j]] = [balls[j], balls[i]];
+function getOrCreateUser(telegramId, name) {
+  var id = String(telegramId);
+  if (!users.has(id)) {
+    users.set(id, { id: id, name: name || 'Player', balance: STARTING_BALANCE });
+  } else if (name) {
+    users.get(id).name = name;
   }
-  return balls;
+  return users.get(id);
 }
 
+// ── Telegram initData verification ───────────────────────────
+// Spec: https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app
+function verifyTelegramInitData(initData, botToken) {
+  if (!initData || !botToken) return null;
+
+  var params = new URLSearchParams(initData);
+  var hash   = params.get('hash');
+  if (!hash) return null;
+
+  params.delete('hash');
+
+  var fields = [];
+  params.forEach(function (value, key) {
+    fields.push(key + '=' + value);
+  });
+  fields.sort();
+
+  var dataCheckString = fields.join('\n');
+  var secretKey       = crypto.createHmac('sha256', 'WebAppData').update(botToken).digest();
+  var computed        = crypto.createHmac('sha256', secretKey).update(dataCheckString).digest('hex');
+
+  if (computed !== hash) return null;
+
+  var userJson = params.get('user');
+  if (!userJson) return null;
+  try {
+    return JSON.parse(userJson);
+  } catch (e) {
+    return null;
+  }
+}
+
+// ── Provably fair card generation ─────────────────────────────
+/**
+ * generateCard(seed)
+ *
+ * Builds one 5×5 Bingo card deterministically from seed.
+ *
+ * Column pools (standard Bingo rules):
+ *   B : 1 – 15   (5 numbers chosen)
+ *   I : 16 – 30  (5 numbers chosen)
+ *   N : 31 – 45  (5 numbers chosen, centre = 'FREE')
+ *   G : 46 – 60  (5 numbers chosen)
+ *   O : 61 – 75  (5 numbers chosen)
+ *
+ * Each pool is independently shuffled with Fisher-Yates where
+ * every swap index comes from:
+ *   HMAC-SHA256(seed, col + ':' + swapIndex + ':' + currentPool)
+ * Folding col, index AND the live pool state into the HMAC input
+ * ensures every decision is uniquely and verifiably derived.
+ */
 function generateCard(seed) {
-  const ranges = {
-    B:[1,15], I:[16,30], N:[31,45], G:[46,60], O:[61,75],
+  var ranges = {
+    B: [1,  15],
+    I: [16, 30],
+    N: [31, 45],
+    G: [46, 60],
+    O: [61, 75],
   };
-  const columns = {};
-  BINGO_COLS.forEach((col, ci) => {
-    const [min, max] = ranges[col];
-    const pool = Array.from({ length: max - min + 1 }, (_, i) => i + min);
-    for (let i = pool.length - 1; i > 0; i--) {
-      const j = crypto
+  var card     = {};
+  var colNames = ['B', 'I', 'N', 'G', 'O'];
+
+  for (var c = 0; c < colNames.length; c++) {
+    var col  = colNames[c];
+    var min  = ranges[col][0];
+    var max  = ranges[col][1];
+    var pool = [];
+
+    for (var n = min; n <= max; n++) {
+      pool.push(n);
+    }
+
+    // Fisher-Yates shuffle seeded by HMAC-SHA256
+    for (var i = pool.length - 1; i > 0; i--) {
+      var hmacInput = col + ':' + i + ':' + pool.join(',');
+      var hmacHex   = crypto
         .createHmac('sha256', seed)
-        .update(`${col}_${i}`)
-        .digest()
-        .readUInt32BE(0) % (i + 1);
-      [pool[i], pool[j]] = [pool[j], pool[i]];
+        .update(hmacInput)
+        .digest('hex');
+      var randInt   = parseInt(hmacHex.slice(0, 8), 16);
+      var j         = randInt % (i + 1);
+      // swap pool[i] and pool[j]
+      var tmp  = pool[i];
+      pool[i]  = pool[j];
+      pool[j]  = tmp;
     }
-    columns[col] = pool.slice(0, 5);
-  });
-  columns.N[2] = 'FREE';
-  return columns;
+
+    card[col] = pool.slice(0, 5);
+  }
+
+  // Standard Bingo: centre of N column is always FREE
+  card.N[2] = 'FREE';
+  return card;
 }
 
-function buildMask(cardColumns, calledSet) {
-  let mask = 1 << FREE_BIT;
-  BINGO_COLS.forEach((col, ci) => {
-    cardColumns[col]?.forEach((val, row) => {
-      if (val !== 'FREE' && calledSet.has(val)) {
-        mask |= (1 << (ci * 5 + row));
-      }
+/**
+ * generateCallSequence(seed)
+ *
+ * Produces a shuffled array of numbers 1–75 (the call order)
+ * using the same HMAC-SHA256-seeded Fisher-Yates algorithm,
+ * but with 'CALL' as the column prefix.
+ */
+function generateCallSequence(seed) {
+  var pool = [];
+  for (var n = 1; n <= 75; n++) {
+    pool.push(n);
+  }
+
+  for (var i = pool.length - 1; i > 0; i--) {
+    var hmacInput = 'CALL:' + i + ':' + pool.join(',');
+    var hmacHex   = crypto
+      .createHmac('sha256', seed)
+      .update(hmacInput)
+      .digest('hex');
+    var randInt   = parseInt(hmacHex.slice(0, 8), 16);
+    var j         = randInt % (i + 1);
+    var tmp  = pool[i];
+    pool[i]  = pool[j];
+    pool[j]  = tmp;
+  }
+
+  return pool;
+}
+
+// ── Win detection ─────────────────────────────────────────────
+/**
+ * checkWin(card, marked)
+ *
+ * Returns a pattern name string if the player has a valid win,
+ * or null if not yet.
+ *
+ * Patterns checked:
+ *   FULL_HOUSE — all 25 cells (including FREE) marked
+ *   ROW        — any complete horizontal row
+ *   COLUMN     — any complete vertical column
+ *   DIAGONAL   — main diagonal (B0→O4) or anti-diagonal (B4→O0)
+ *
+ * FREE cell (N column, row index 2) counts as always marked.
+ */
+function checkWin(card, marked) {
+  var cols = ['B', 'I', 'N', 'G', 'O'];
+  var rows = [0, 1, 2, 3, 4];
+
+  function isMarked(col, row) {
+    var val = card[col][row];
+    return val === 'FREE' || marked.has(col + ':' + val);
+  }
+
+  // Full house — every cell marked
+  var fullHouse = cols.every(function (c) {
+    return rows.every(function (r) {
+      return isMarked(c, r);
     });
   });
-  return mask;
-}
+  if (fullHouse) return 'FULL_HOUSE';
 
-function checkWin(mask) {
-  return WIN_MASKS.some(pm => (mask & pm) === pm);
-}
-
-// ── Update one player's bitmask when a ball is drawn ─────────────
-function updatePlayerMask(player, ball) {
-  BINGO_COLS.forEach((col, ci) => {
-    player.card[col]?.forEach((val, row) => {
-      if (val === ball) {
-        player.mask |= (1 << (ci * 5 + row));
-      }
-    });
-  });
-}
-
-async function awardCoins(userId, amount, description) {
-  try {
-    await dbQuery(
-      `UPDATE wallets SET coin_balance = coin_balance + $1 WHERE user_id = $2`,
-      [amount, userId]
-    );
-    await dbQuery(
-      `INSERT INTO coin_transactions
-         (user_id, rule_key, coins, balance_after, description)
-       SELECT $1, 'bingo_win', $2, coin_balance, $3
-       FROM wallets WHERE user_id = $1`,
-      [userId, amount, description]
-    );
-  } catch (err) {
-    console.error('[awardCoins]', err.message);
-  }
-}
-
-async function refundCoins(userId, amount) {
-  try {
-    await dbQuery(
-      `UPDATE wallets SET coin_balance = coin_balance + $1 WHERE user_id = $2`,
-      [amount, userId]
-    );
-    await dbQuery(
-      `INSERT INTO coin_transactions
-         (user_id, rule_key, coins, balance_after, description)
-       SELECT $1, 'refund', $2, coin_balance,
-              'Bingo refund — disconnected before game started'
-       FROM wallets WHERE user_id = $1`,
-      [userId, amount]
-    );
-  } catch (err) {
-    console.error('[refundCoins]', err.message);
-  }
-}
-
-// ================================================================
-//  GAME FUNCTIONS
-// ================================================================
-
-function drawNextBall() {
-  if (gameState.drawIndex >= gameState.ballSequence.length) {
-    endGame('all_balls_drawn');
-    return;
+  // Any horizontal row
+  for (var r = 0; r < 5; r++) {
+    (function (row) {
+      // captured via IIFE to avoid closure-in-loop bug
+    })(r);
+    var rowComplete = cols.every(function (c) { return isMarked(c, r); });
+    if (rowComplete) return 'ROW';
   }
 
-  const ball = gameState.ballSequence[gameState.drawIndex++];
-  gameState.drawnNumbers.push(ball);
+  // Any vertical column
+  for (var ci = 0; ci < cols.length; ci++) {
+    var col     = cols[ci];
+    var colDone = rows.every(function (r) { return isMarked(col, r); });
+    if (colDone) return 'COLUMN';
+  }
 
-  // Update every active player's server bitmask
-  gameState.players.forEach(player => {
-    if (player.status === 'active') {
-      updatePlayerMask(player, ball);
-    }
-  });
+  // Main diagonal: B[0] I[1] N[2]=FREE G[3] O[4]
+  var mainDiag = cols.every(function (c, i) { return isMarked(c, i); });
+  if (mainDiag) return 'DIAGONAL';
 
-  io.emit('new_number', {
-    number:      ball,
-    letter:      ballLetter(ball),
-    called:      gameState.drawnNumbers,
-    totalCalled: gameState.drawnNumbers.length,
-  });
+  // Anti-diagonal: B[4] I[3] N[2]=FREE G[1] O[0]
+  var antiDiag = cols.every(function (c, i) { return isMarked(c, 4 - i); });
+  if (antiDiag) return 'DIAGONAL';
 
-  console.log(`[Ball] ${ballLetter(ball)}-${ball} | Total: ${gameState.drawnNumbers.length}`);
+  return null;
 }
 
-function startBingoRound() {
-  if (gameState.isActive) return;
-
-  gameState.ballSeed     = crypto.randomBytes(32).toString('hex');
-  gameState.ballSequence = generateBallSequence(gameState.ballSeed);
-  gameState.drawnNumbers = [];
-  gameState.drawIndex    = 0;
-  gameState.isActive     = true;
-  gameState.winner       = null;
-  gameState.prizePool    = gameState.players.size * BUY_IN_COINS * 0.9;
-
-  io.emit('game_started', {
-    message:     '🎯 ቢንጎ ጀምሯል!',
-    playerCount: gameState.players.size,
-    prizePool:   gameState.prizePool,
-    ballSeed:    gameState.ballSeed,
-  });
-
-  console.log(`[Game] Started | Players: ${gameState.players.size} | Prize: ${gameState.prizePool}`);
-  gameState.ballInterval = setInterval(drawNextBall, BALL_INTERVAL_MS);
+// ── Room helpers ──────────────────────────────────────────────
+function createRoom(roomId) {
+  var room = {
+    id:             roomId,
+    status:         'WAITING',    // WAITING | COUNTDOWN | IN_PROGRESS | FINISHED
+    players:        new Map(),    // socketId → { userId, name, card, marked }
+    serverSeed:     null,
+    serverSeedHash: null,
+    callSequence:   [],
+    calledNumbers:  [],
+    callTimer:      null,
+    countdownTimer: null,
+    pot:            0,
+  };
+  rooms.set(roomId, room);
+  return room;
 }
 
-function endGame(reason) {
-  clearInterval(gameState.ballInterval);
-  gameState.ballInterval = null;
-  gameState.isActive     = false;
-
-  io.emit('game_over', {
-    reason,
-    winner:     gameState.winner,
-    prizePool:  gameState.prizePool,
-    totalDrawn: gameState.drawnNumbers.length,
-    message:    gameState.winner
-      ? `🏆 ${gameState.winner.username} won!`
-      : '😔 No winner this round.',
-  });
-
-  console.log(`[Game] Over — ${reason} | Winner: ${gameState.winner?.username ?? 'none'}`);
-
-  // Log this round to the database for reporting (non-blocking — never crash the game loop)
-  dbQuery(
-    `INSERT INTO bingo_rounds
-       (winner_user_id, player_count, prize_pool_coins, prize_etb, balls_drawn, end_reason)
-     VALUES ($1, $2, $3, $4, $5, $6)`,
-    [
-      gameState.winner?.userId ?? null,
-      gameState.players.size,
-      gameState.prizePool,
-      gameState.winner?.etbPrize ?? 0,
-      gameState.drawnNumbers.length,
-      reason,
-    ]
-  ).catch(err => console.error('[bingo_rounds log]', err.message));
+function getRoom(roomId) {
+  return rooms.get(roomId) || createRoom(roomId);
 }
 
-function startCountdown() {
-  let count = 5;
-  gameState.cdInterval = setInterval(() => {
-    io.emit('countdown', { seconds: count });
-    count--;
-    if (count < 0) {
-      clearInterval(gameState.cdInterval);
-      gameState.cdInterval = null;
-      startBingoRound();
+function broadcastRoomState(room) {
+  io.to(room.id).emit('room_state', {
+    status:        room.status,
+    playerCount:   room.players.size,
+    pot:           room.pot,
+    calledNumbers: room.calledNumbers,
+  });
+}
+
+// ── Round lifecycle ───────────────────────────────────────────
+function startCountdown(room) {
+  if (room.status !== 'WAITING') return;
+
+  room.status         = 'COUNTDOWN';
+  room.serverSeed     = crypto.randomBytes(32).toString('hex');
+  room.serverSeedHash = sha256(room.serverSeed);
+
+  var secondsLeft = COUNTDOWN_SECONDS;
+
+  io.to(room.id).emit('countdown', {
+    secondsLeft:    secondsLeft,
+    serverSeedHash: room.serverSeedHash,
+  });
+
+  room.countdownTimer = setInterval(function () {
+    secondsLeft -= 1;
+    if (secondsLeft <= 0) {
+      clearInterval(room.countdownTimer);
+      startGame(room);
+    } else {
+      io.to(room.id).emit('countdown', {
+        secondsLeft:    secondsLeft,
+        serverSeedHash: room.serverSeedHash,
+      });
     }
   }, 1000);
 }
 
-// ================================================================
-//  SOCKET.IO
-// ================================================================
-io.on('connection', socket => {
-  console.log(`[Socket] Connected: ${socket.id}`);
+function startGame(room) {
+  room.status        = 'IN_PROGRESS';
+  room.callSequence  = generateCallSequence(room.serverSeed);
+  room.calledNumbers = [];
 
-  // ── join_game ────────────────────────────────────────────────
-  socket.on('join_game', async userData => {
-    const { userId, username } = userData || {};
-    if (!userId || !username) {
-      return socket.emit('error', { message: 'userId and username required' });
-    }
-
-    // ── Check for reconnect (same userId exists in players map) ──
-    let existingPlayer = null;
-    gameState.players.forEach(p => {
-      if (p.userId === userId) existingPlayer = p;
-    });
-
-    if (existingPlayer) {
-      // ── RECONNECT PATH ──────────────────────────────────────
-      console.log(`[Reconnect] ${username}`);
-
-      // Cancel grace period timer
-      if (existingPlayer.dcTimer) {
-        clearTimeout(existingPlayer.dcTimer);
-        existingPlayer.dcTimer = null;
-      }
-
-      // Swap socket reference
-      gameState.players.delete(existingPlayer.socketId);
-      existingPlayer.socketId = socket.id;
-      existingPlayer.status   = 'active';
-      gameState.players.set(socket.id, existingPlayer);
-
-      // Send full current state so client can catch up
-      // ── NOTE: card is sent here so client cardRef can be updated ──
-      socket.emit('reconnected', {
-        message:      '🔄 ተመልሰዋል! Reconnected.',
-        isActive:     gameState.isActive,
-        drawnNumbers: gameState.drawnNumbers,
-        prizePool:    gameState.prizePool,
-        playerCount:  gameState.players.size,
-        yourCard:     existingPlayer.card,   // ← client updates cardRef here
-        yourMask:     existingPlayer.mask,
-      });
-
-      io.emit('player_count', gameState.players.size);
-      io.emit('player_reconnected', {
-        username,
-        playerCount: gameState.players.size,
-        message: `✅ ${username} ተመልሷል!`,
-      });
-
-    } else {
-      // ── NEW JOIN PATH ────────────────────────────────────────
-
-      // Deduct buy-in coins from wallet
-      const { rows: [wallet] } = await dbQuery(
-        `UPDATE wallets
-           SET coin_balance = coin_balance - $1
-         WHERE user_id = $2
-           AND coin_balance >= $1
-         RETURNING coin_balance`,
-        [BUY_IN_COINS, userId]
-      );
-
-      if (process.env.DATABASE_URL && !wallet) {
-        return socket.emit('error', {
-          message: `Need ${BUY_IN_COINS} OmniCoins to join`,
-        });
-      }
-
-      // Generate card with crypto seed
-      const card = generateCard(`${userId}_${Date.now()}`);
-
-      const playerEntry = {
-        userId,
-        username,
-        socketId: socket.id,
-        card,                       // { B:[],I:[],N:[],G:[],O:[] }
-        mask:     1 << FREE_BIT,    // FREE center always marked
-        status:   'active',
-        dcTimer:  null,
-        joinedAt: Date.now(),
-        refunded: false,
-      };
-
-      gameState.players.set(socket.id, playerEntry);
-
-      socket.emit('joined', {
-        message:     `ተቀላቀሉ! ${username}`,
-        card,                        // ← client stores in cardRef
-        buyIn:       BUY_IN_COINS,
-        coinBalance: wallet?.coin_balance ?? 'N/A',
-        playerCount: gameState.players.size,
-      });
-
-      io.emit('player_count', gameState.players.size);
-      console.log(`[Join] ${username} | Players: ${gameState.players.size}`);
-
-      // Auto-start countdown when 2+ players
-      if (
-        gameState.players.size >= 2 &&
-        !gameState.isActive &&
-        !gameState.cdInterval
-      ) {
-        startCountdown();
-      }
-    }
+  // Issue a unique card to each player
+  room.players.forEach(function (player, socketId) {
+    player.card   = generateCard(room.serverSeed + ':' + socketId);
+    player.marked = new Set();
+    io.to(socketId).emit('card_assigned', { card: player.card });
   });
 
-  // ── claim_bingo ──────────────────────────────────────────────
-  socket.on('claim_bingo', async () => {
-    if (!gameState.isActive) {
-      return socket.emit('claim_rejected', { reason: 'no_active_game' });
+  broadcastRoomState(room);
+  io.to(room.id).emit('game_started', { serverSeedHash: room.serverSeedHash });
+
+  var callIndex = 0;
+
+  room.callTimer = setInterval(function () {
+    if (room.status !== 'IN_PROGRESS') {
+      clearInterval(room.callTimer);
+      return;
     }
-
-    const player = gameState.players.get(socket.id);
-    if (!player || player.status !== 'active') {
-      return socket.emit('claim_rejected', { reason: 'player_not_found' });
+    if (callIndex >= room.callSequence.length) {
+      clearInterval(room.callTimer);
+      endGame(room, null);
+      return;
     }
+    var num = room.callSequence[callIndex];
+    callIndex += 1;
+    room.calledNumbers.push(num);
+    io.to(room.id).emit('number_called', {
+      number:        num,
+      letter:        letterForNumber(num),
+      calledNumbers: room.calledNumbers,
+    });
+  }, CALL_INTERVAL_MS);
+}
 
-    // ── Layer 1: server bitmask check ────────────────────────
-    const primaryWin = checkWin(player.mask);
+function endGame(room, winnerSocketId) {
+  room.status = 'FINISHED';
+  clearInterval(room.callTimer);
+  clearInterval(room.countdownTimer);
 
-    // ── Layer 2: recompute from scratch (anti-cheat) ─────────
-    const recomputed   = buildMask(player.card, new Set(gameState.drawnNumbers));
-    const secondaryWin = checkWin(recomputed);
+  var payout   = 0;
+  var winnerId = null;
 
-    if (!primaryWin || !secondaryWin) {
-      console.log(`[Claim Rejected] ${player.username}`);
-      return socket.emit('claim_rejected', {
-        reason:  'no_winning_pattern',
-        message: '❌ ቢንጎ አይደለም — ቀጥሉ!',
+  if (winnerSocketId && room.players.has(winnerSocketId)) {
+    var winner = room.players.get(winnerSocketId);
+    payout     = room.pot;
+    winnerId   = winner.userId;
+    var user   = users.get(winner.userId);
+    if (user) user.balance += payout;
+  }
+
+  // Reveal the serverSeed — players can now verify fairness
+  io.to(room.id).emit('game_over', {
+    winnerId:         winnerId,
+    payout:           payout,
+    serverSeed:       room.serverSeed,       // revealed after game
+    serverSeedHash:   room.serverSeedHash,   // committed before game
+    callSequenceUsed: room.calledNumbers,
+  });
+
+  // Reset room after 6 seconds for the next round
+  setTimeout(function () {
+    room.status         = 'WAITING';
+    room.serverSeed     = null;
+    room.serverSeedHash = null;
+    room.callSequence   = [];
+    room.calledNumbers  = [];
+    room.pot            = 0;
+    room.players.forEach(function (p) {
+      p.card   = null;
+      p.marked = new Set();
+    });
+    broadcastRoomState(room);
+  }, 6000);
+}
+
+// ── Socket.IO ─────────────────────────────────────────────────
+io.on('connection', function (socket) {
+  var auth         = socket.handshake.auth || {};
+  var verifiedUser = null;
+
+  // Auth: verify Telegram initData when bot token is configured
+  if (TELEGRAM_BOT_TOKEN) {
+    verifiedUser = verifyTelegramInitData(auth.initData, TELEGRAM_BOT_TOKEN);
+    if (!verifiedUser) {
+      socket.emit('auth_error', {
+        message: 'Telegram authentication failed. Please reopen the app from Telegram.',
       });
+      socket.disconnect(true);
+      return;
     }
-
-    // ── Valid win ────────────────────────────────────────────
-    clearInterval(gameState.ballInterval);
-
-    const coinPrize = gameState.prizePool;
-    const etbPrize  = parseFloat((coinPrize * 0.05).toFixed(2));
-
-    await awardCoins(
-      player.userId,
-      coinPrize,
-      `Bingo win — ${gameState.drawnNumbers.length} balls drawn`
-    );
-    await dbQuery(
-      `UPDATE wallets SET balance_etb = balance_etb + $1 WHERE user_id = $2`,
-      [etbPrize, player.userId]
-    );
-
-    gameState.winner = {
-      userId:    player.userId,
-      username:  player.username,
-      coinPrize,
-      etbPrize,
+  } else {
+    // Dev-mode fallback: trust client-supplied id (safe for local testing)
+    verifiedUser = {
+      id:         auth.telegramId || ('guest-' + socket.id),
+      first_name: auth.name       || 'Guest',
     };
-
-    endGame('winner');
-  });
-
-  // ── admin_start_round ────────────────────────────────────────
-  socket.on('admin_start_round', pass => {
-    if (pass !== ADMIN_PASS) {
-      return socket.emit('error', { message: 'Invalid admin password' });
-    }
-    if (gameState.isActive) {
-      return socket.emit('admin_ack', { ok: false, message: 'Already running' });
-    }
-    io.emit('admin_action', {
-      action:  'force_start',
-      message: '🔧 Admin ጨዋታ ጀምሯል!',
-    });
-    startBingoRound();
-    socket.emit('admin_ack', {
-      ok:          true,
-      message:     'Round started',
-      playerCount: gameState.players.size,
-      prizePool:   gameState.prizePool,
-    });
-  });
-
-  // ── admin_stop_round ─────────────────────────────────────────
-  socket.on('admin_stop_round', pass => {
-    if (pass !== ADMIN_PASS) {
-      return socket.emit('error', { message: 'Invalid admin password' });
-    }
-    if (!gameState.isActive) {
-      return socket.emit('admin_ack', { ok: false, message: 'No game running' });
-    }
-    io.emit('admin_action', {
-      action:  'force_stop',
-      message: '🔧 Admin ጨዋታ አቆሟል!',
-    });
-    endGame('admin_stopped');
-    socket.emit('admin_ack', { ok: true, message: 'Stopped' });
-  });
-
-  // ── admin_get_state ──────────────────────────────────────────
-  socket.on('admin_get_state', pass => {
-    if (pass !== ADMIN_PASS) {
-      return socket.emit('error', { message: 'Invalid admin password' });
-    }
-    socket.emit('admin_state', {
-      isActive:     gameState.isActive,
-      drawnCount:   gameState.drawnNumbers.length,
-      drawnNumbers: gameState.drawnNumbers,
-      prizePool:    gameState.prizePool,
-      playerCount:  gameState.players.size,
-      players: [...gameState.players.values()].map(p => ({
-        username: p.username,
-        status:   p.status,
-        refunded: p.refunded,
-      })),
-    });
-  });
-
-  // ── chat ─────────────────────────────────────────────────────
-  socket.on('chat', ({ text }) => {
-    const player = gameState.players.get(socket.id);
-    if (!player || !text?.trim()) return;
-    io.emit('chat', {
-      username: player.username,
-      text:     text.trim().slice(0, 200),
-      ts:       Date.now(),
-    });
-  });
-
-  // ── keep-alive ───────────────────────────────────────────────
-  socket.on('ping_client',  () => socket.emit('pong_server'));
-  socket.on('pong_server',  () => { socket.isAlive = true; });
-
-  // ── disconnect — 30-second grace period ─────────────────────
-  socket.on('disconnect', reason => {
-    const player = gameState.players.get(socket.id);
-    if (!player) return;
-
-    player.status = 'disconnected';
-    console.log(`[DC] ${player.username} (${reason}) — grace ${GRACE_PERIOD_MS/1000}s`);
-
-    io.emit('player_disconnected', {
-      username:     player.username,
-      graceSeconds: GRACE_PERIOD_MS / 1000,
-      message:      `⚠️ ${player.username} ተቋርጧል — ${GRACE_PERIOD_MS/1000}s ለ reconnect`,
-      playerCount:  gameState.players.size,
-    });
-
-    player.dcTimer = setTimeout(async () => {
-      const current = gameState.players.get(socket.id);
-      if (!current || current.status !== 'disconnected') return;
-
-      // Refund buy-in if game hasn't started
-      if (!gameState.isActive && !current.refunded) {
-        await refundCoins(current.userId, BUY_IN_COINS);
-        current.refunded = true;
-      }
-
-      gameState.players.delete(socket.id);
-
-      io.emit('player_removed', {
-        username:    player.username,
-        playerCount: gameState.players.size,
-        message:     `${player.username} ሰዓቱ አልፏል — ወጥቷል`,
-      });
-
-      console.log(`[Grace Expired] ${player.username} removed`);
-
-      // End game if no active players remain
-      const activePlayers = [...gameState.players.values()]
-        .filter(p => p.status === 'active');
-      if (gameState.isActive && activePlayers.length === 0) {
-        endGame('all_players_disconnected');
-      }
-
-    }, GRACE_PERIOD_MS);
-  });
-});
-
-// ── Heartbeat — remove zombie sockets ────────────────────────────
-setInterval(() => {
-  io.sockets.sockets.forEach(s => {
-    if (s.isAlive === false) { s.disconnect(true); return; }
-    s.isAlive = false;
-    s.emit('server_ping');
-  });
-}, 30000);
-
-// ================================================================
-//  REST ENDPOINTS
-// ================================================================
-
-app.get('/health', (_req, res) => {
-  res.json({
-    status:   'ok',
-    uptime:   Math.floor(process.uptime()),
-    isActive: gameState.isActive,
-    players:  gameState.players.size,
-    services: {
-      database: !!db,
-      ai:       !!process.env.ANTHROPIC_API_KEY,
-      chapa:    !!process.env.CHAPA_SECRET_KEY,
-      telebirr: !!process.env.TELEBIRR_APP_ID,
-      cbebirr:  !!process.env.CBEBIRR_MERCHANT_ID,
-    },
-  });
-});
-
-app.get('/admin/state', (req, res) => {
-  if (req.headers['x-admin-key'] !== ADMIN_PASS) {
-    return res.status(403).json({ error: 'forbidden' });
   }
-  res.json({
-    isActive:    gameState.isActive,
-    drawnCount:  gameState.drawnNumbers.length,
-    prizePool:   gameState.prizePool,
-    playerCount: gameState.players.size,
-    players: [...gameState.players.values()].map(p => ({
-      username: p.username,
-      status:   p.status,
-      refunded: p.refunded,
-    })),
+
+  var user          = getOrCreateUser(verifiedUser.id, verifiedUser.first_name);
+  var currentRoomId = null;
+
+  // Send profile to this socket on connect
+  socket.emit('profile', {
+    id:      user.id,
+    name:    user.name,
+    balance: user.balance,
   });
+
+  // ── join_room ─────────────────────────────────────────────
+  socket.on('join_room', function (payload) {
+    var roomId = (payload && payload.roomId) || 'main';
+    var room   = getRoom(roomId);
+
+    if (room.status === 'IN_PROGRESS' || room.status === 'COUNTDOWN') {
+      socket.emit('error_msg', { message: 'Round already in progress. Please wait for the next one.' });
+      return;
+    }
+    if (user.balance < ENTRY_FEE) {
+      socket.emit('error_msg', { message: 'Insufficient coins. Need ' + ENTRY_FEE + ' to join.' });
+      return;
+    }
+
+    user.balance  -= ENTRY_FEE;
+    room.pot      += ENTRY_FEE;
+    currentRoomId  = roomId;
+
+    socket.join(roomId);
+    room.players.set(socket.id, {
+      userId: user.id,
+      name:   user.name,
+      card:   null,
+      marked: new Set(),
+    });
+
+    socket.emit('joined_room', {
+      roomId:  roomId,
+      balance: user.balance,
+      pot:     room.pot,
+    });
+
+    broadcastRoomState(room);
+
+    if (room.players.size >= MIN_PLAYERS && room.status === 'WAITING') {
+      startCountdown(room);
+    }
+  });
+
+  // ── mark_cell ─────────────────────────────────────────────
+  socket.on('mark_cell', function (payload) {
+    if (!currentRoomId) return;
+    var room = rooms.get(currentRoomId);
+    if (!room || room.status !== 'IN_PROGRESS') return;
+
+    var player = room.players.get(socket.id);
+    if (!player || !player.card) return;
+
+    var col   = payload && payload.col;
+    var value = payload && payload.value;
+
+    // Server-side guard: only mark if the number has actually been called
+    if (value !== 'FREE' && !room.calledNumbers.includes(value)) {
+      socket.emit('error_msg', { message: 'That number has not been called yet.' });
+      return;
+    }
+
+    player.marked.add(col + ':' + value);
+    socket.emit('cell_marked', { col: col, value: value });
+  });
+
+  // ── claim_bingo ───────────────────────────────────────────
+  socket.on('claim_bingo', function () {
+    if (!currentRoomId) return;
+    var room = rooms.get(currentRoomId);
+    if (!room || room.status !== 'IN_PROGRESS') return;
+
+    var player = room.players.get(socket.id);
+    if (!player || !player.card) return;
+
+    var pattern = checkWin(player.card, player.marked);
+    if (pattern) {
+      endGame(room, socket.id);
+    } else {
+      socket.emit('error_msg', { message: 'No valid Bingo pattern found yet. Keep going!' });
+    }
+  });
+
+  // ── leave / disconnect ────────────────────────────────────
+  function handleLeave() {
+    if (!currentRoomId) return;
+    var room = rooms.get(currentRoomId);
+    if (room) {
+      room.players.delete(socket.id);
+      broadcastRoomState(room);
+    }
+    currentRoomId = null;
+  }
+
+  socket.on('leave_room',  handleLeave);
+  socket.on('disconnect',  handleLeave);
 });
 
-app.post('/admin/start', (req, res) => {
-  if (req.headers['x-admin-key'] !== ADMIN_PASS) {
-    return res.status(403).json({ error: 'forbidden' });
-  }
-  if (gameState.isActive) {
-    return res.json({ ok: false, message: 'Already running' });
-  }
-  io.emit('admin_action', { action:'force_start', message:'🔧 Admin ጨዋታ ጀምሯል!' });
-  startBingoRound();
-  res.json({ ok: true, players: gameState.players.size, prizePool: gameState.prizePool });
-});
-
-app.post('/admin/stop', (req, res) => {
-  if (req.headers['x-admin-key'] !== ADMIN_PASS) {
-    return res.status(403).json({ error: 'forbidden' });
-  }
-  if (!gameState.isActive) return res.json({ ok: false, message: 'No game running' });
-  endGame('admin_stopped');
-  res.json({ ok: true });
-});
-
-// ================================================================
-//  START
-// ================================================================
-server.listen(PORT, () => {
+// ── Start server ──────────────────────────────────────────────
+server.listen(PORT, function () {
   console.log('');
-  console.log(`  ✅  OmniHub Server running on port ${PORT}`);
-  console.log(`  📡  Socket.io : ws://localhost:${PORT}`);
-  console.log(`  🔗  Health    : http://localhost:${PORT}/health`);
-  console.log(`  🔒  Admin     : http://localhost:${PORT}/admin/state`);
-  console.log(`  🌐  CORS OK   : ${ALLOWED_ORIGINS.join(', ')}`);
+  console.log('  ╔═══════════════════════════════════════╗');
+  console.log('  ║   OmniHub Super App — server running  ║');
+  console.log('  ╚═══════════════════════════════════════╝');
+  console.log('  Port  : ' + PORT);
+  console.log('  Auth  : ' + (TELEGRAM_BOT_TOKEN ? 'Telegram initData verification ENABLED' : 'Dev mode — set TELEGRAM_BOT_TOKEN for production'));
   console.log('');
-
-  // Start AI cron jobs (daily summary, holiday rewards)
-  try { registerAICronJobs(); } catch (e) {
-    console.log('  ⚠️  AI cron skipped:', e.message);
-  }
 });
