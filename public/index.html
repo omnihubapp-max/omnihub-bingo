@@ -1,219 +1,281 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport"
-        content="width=device-width, initial-scale=1.0,
-                 maximum-scale=1.0, user-scalable=no,
-                 viewport-fit=cover" />
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no,viewport-fit=cover"/>
   <title>OmniHub</title>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
-  <link rel="stylesheet" href="style.css" />
+  <link rel="stylesheet" href="style.css"/>
 </head>
 <body>
 <div id="app">
 
-  <!-- ═══════════════════════════════════
-       DASHBOARD VIEW
-       ═══════════════════════════════════ -->
-  <section id="view-dashboard" class="view active">
-
-    <!-- Hero header -->
-    <div class="hero">
-      <div class="hero-topbar">
-        <div class="hero-brand">OmniHub</div>
-        <div class="balance-badge">
-          <span class="coin-icon">🎲</span>
-          <span class="balance-num" id="balance-amount">--</span>
-        </div>
-      </div>
-      <div class="hero-welcome">
-        <div class="welcome-greeting">Good Game</div>
-        <div class="welcome-name">Welcome<span id="user-name"></span> 👋</div>
-        <div class="welcome-sub">Choose a game and start winning</div>
+<!-- ═══════════ DASHBOARD ═══════════ -->
+<section id="view-dashboard" class="view active">
+  <div class="hero">
+    <div class="hero-top">
+      <div class="brand">OmniHub</div>
+      <div class="wallet-pill">
+        <span>🎲</span>
+        <span id="balance-amount">--</span>
+        <span class="etb-sep">·</span>
+        <span class="etb-val" id="balance-etb">-- ETB</span>
       </div>
     </div>
-
-    <!-- Live status strip -->
-    <div class="live-banner">
-      <div class="live-dot"></div>
-      <span>Server live · Provably Fair · Instant payouts</span>
+    <div class="hero-body">
+      <div class="hero-label">GOOD GAME</div>
+      <div class="hero-name">Welcome<span id="user-name"></span> 👋</div>
+      <div class="hero-sub">Choose a game and start winning</div>
     </div>
-
-    <!-- Stats row -->
-    <div class="stats-row">
-      <div class="stat-card">
-        <div class="stat-icon">🏆</div>
-        <div class="stat-val" id="dash-wins">0</div>
-        <div class="stat-label">Wins</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-icon">🎮</div>
-        <div class="stat-val" id="dash-games">0</div>
-        <div class="stat-label">Games</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-icon">🔥</div>
-        <div class="stat-val">Fair</div>
-        <div class="stat-label">RNG Type</div>
-      </div>
+    <div class="hero-stats">
+      <div class="hstat"><div class="hstat-v" id="h-wins">0</div><div class="hstat-l">Wins</div></div>
+      <div class="hstat-div"></div>
+      <div class="hstat"><div class="hstat-v" id="h-games">0</div><div class="hstat-l">Games</div></div>
+      <div class="hstat-div"></div>
+      <div class="hstat"><div class="hstat-v gold">Fair</div><div class="hstat-l">RNG</div></div>
     </div>
+  </div>
 
-    <!-- Games section -->
-    <div class="section-label">🎯 Games</div>
-    <div class="game-grid">
+  <div class="live-bar"><div class="live-dot"></div>Server live · Provably Fair · Instant payouts</div>
 
-      <button id="open-bingo" class="game-tile featured">
-        <span class="tile-icon">🎱</span>
-        <div class="tile-name">5×5 Bingo</div>
-        <div style="margin-top:8px">
-          <span class="tile-badge">Provably Fair</span>
-        </div>
-      </button>
+  <div class="sec-label">🎯 GAMES</div>
+  <div class="game-grid">
+    <button id="open-bingo" class="gtile featured">
+      <div class="gtile-glow"></div>
+      <div class="gtile-icon">🎱</div>
+      <div class="gtile-name">5×5 Bingo</div>
+      <div class="gtile-badge">PROVABLY FAIR</div>
+    </button>
+    <button id="open-slot" class="gtile">
+      <div class="gtile-icon">🎰</div>
+      <div class="gtile-name">Slot Game</div>
+      <div class="gtile-badge dim">30 coins/spin</div>
+    </button>
+    <button id="open-keno" class="gtile">
+      <div class="gtile-icon">🎯</div>
+      <div class="gtile-name">Keno</div>
+      <div class="gtile-badge dim">50 coins/round</div>
+    </button>
+    <button id="open-card" class="gtile">
+      <div class="gtile-icon">🃏</div>
+      <div class="gtile-name">High / Low</div>
+      <div class="gtile-badge dim">20 coins/guess</div>
+    </button>
+  </div>
 
-      <div class="game-tile disabled">
-        <span class="tile-icon">🎰</span>
-        <div class="tile-name">Slot Game</div>
-        <div style="margin-top:8px">
-          <span class="tile-badge coming">Coming Soon</span>
-        </div>
-      </div>
+  <button id="open-howto" class="howto-btn">
+    <span>⚡ How It Works</span><span>›</span>
+  </button>
+</section>
 
-      <div class="game-tile disabled">
-        <span class="tile-icon">🃏</span>
-        <div class="tile-name">Card Game</div>
-        <div style="margin-top:8px">
-          <span class="tile-badge coming">Coming Soon</span>
-        </div>
-      </div>
+<!-- ═══════════ BINGO ═══════════ -->
+<section id="view-bingo" class="view">
+  <div class="gtopbar">
+    <button id="back-bingo" class="bk">←</button>
+    <div class="gtitle">5×5 Bingo</div>
+    <div class="wallet-pill sm"><span>🎲</span><span id="balance-bingo">--</span></div>
+  </div>
 
-      <div class="game-tile disabled">
-        <span class="tile-icon">🎯</span>
-        <div class="tile-name">Keno</div>
-        <div style="margin-top:8px">
-          <span class="tile-badge coming">Coming Soon</span>
-        </div>
-      </div>
+  <div id="bingo-status" class="status-banner">Tap Join to enter the next round</div>
+  <div id="bingo-hash" class="hash-bar hidden">🔐 <span id="hash-val">--</span></div>
 
+  <!-- Timer bar -->
+  <div class="timer-wrap hidden" id="timer-wrap">
+    <div class="timer-label">Next number in <span id="timer-sec">4</span>s</div>
+    <div class="timer-track"><div class="timer-bar" id="timer-bar"></div></div>
+  </div>
+
+  <!-- Called numbers strip (last 10) -->
+  <div class="called-wrap">
+    <div class="called-lbl">RECENTLY CALLED</div>
+    <div id="called-strip" class="called-strip"></div>
+  </div>
+
+  <!-- Full 1-75 number board -->
+  <div class="board-wrap">
+    <div class="board-cols">
+      <div class="bcol-h" style="color:#5B9BD5">B</div>
+      <div class="bcol-h" style="color:#9B6FD5">I</div>
+      <div class="bcol-h" style="color:#C9A84C">N</div>
+      <div class="bcol-h" style="color:#4CAF82">G</div>
+      <div class="bcol-h" style="color:#D5956F">O</div>
     </div>
+    <div id="number-board" class="number-board"></div>
+  </div>
 
-    <!-- How it works -->
-    <div class="section-label">⚡ How It Works</div>
-    <div style="padding:0 18px 10px">
-      <div style="background:#12121e;border:1px solid rgba(255,255,255,0.06);border-radius:16px;padding:16px">
-        <div style="display:flex;flex-direction:column;gap:12px">
-          <div style="display:flex;align-items:center;gap:12px">
-            <div style="width:36px;height:36px;border-radius:50%;background:rgba(201,168,76,0.12);border:1px solid rgba(201,168,76,0.25);display:flex;align-items:center;justify-content:center;font-size:1rem;flex-shrink:0">1</div>
-            <div>
-              <div style="font-weight:700;font-size:0.82rem;margin-bottom:2px">Join a Round</div>
-              <div style="font-size:0.72rem;color:rgba(255,255,255,0.45)">Pay 50 coins · get your unique 5×5 card</div>
-            </div>
-          </div>
-          <div style="display:flex;align-items:center;gap:12px">
-            <div style="width:36px;height:36px;border-radius:50%;background:rgba(201,168,76,0.12);border:1px solid rgba(201,168,76,0.25);display:flex;align-items:center;justify-content:center;font-size:1rem;flex-shrink:0">2</div>
-            <div>
-              <div style="font-weight:700;font-size:0.82rem;margin-bottom:2px">Mark Numbers</div>
-              <div style="font-size:0.72rem;color:rgba(255,255,255,0.45)">Tap cells as numbers are called live</div>
-            </div>
-          </div>
-          <div style="display:flex;align-items:center;gap:12px">
-            <div style="width:36px;height:36px;border-radius:50%;background:rgba(201,168,76,0.12);border:1px solid rgba(201,168,76,0.25);display:flex;align-items:center;justify-content:center;font-size:1rem;flex-shrink:0">3</div>
-            <div>
-              <div style="font-weight:700;font-size:0.82rem;margin-bottom:2px">Shout BINGO!</div>
-              <div style="font-size:0.72rem;color:rgba(255,255,255,0.45)">Win the pot · verify fairness anytime</div>
-            </div>
-          </div>
-        </div>
+  <!-- Bingo card -->
+  <div class="card-wrap">
+    <div class="bingo-card">
+      <div class="bingo-hdrs">
+        <div class="bh">B</div><div class="bh">I</div>
+        <div class="bh">N</div><div class="bh">G</div><div class="bh">O</div>
       </div>
-    </div>
-
-  </section>
-
-  <!-- ═══════════════════════════════════
-       BINGO GAME VIEW
-       ═══════════════════════════════════ -->
-  <section id="view-bingo" class="view">
-
-    <!-- Top bar -->
-    <div class="game-topbar">
-      <button id="back-to-dashboard" class="back-btn">&#8592;</button>
-      <div class="game-title">5×5 Bingo</div>
-      <div class="balance-badge">
-        <span class="coin-icon">🎲</span>
-        <span class="balance-num" id="balance-amount-game">--</span>
+      <div id="bingo-grid" class="bingo-grid">
+        <div class="bc opacity15">?</div><div class="bc opacity15">?</div>
+        <div class="bc opacity15">?</div><div class="bc opacity15">?</div>
+        <div class="bc opacity15">?</div>
+        <div class="bc opacity15">?</div><div class="bc opacity15">?</div>
+        <div class="bc opacity15">?</div><div class="bc opacity15">?</div>
+        <div class="bc opacity15">?</div>
+        <div class="bc opacity15">?</div><div class="bc opacity15">?</div>
+        <div class="bc free marked">FREE</div>
+        <div class="bc opacity15">?</div><div class="bc opacity15">?</div>
+        <div class="bc opacity15">?</div><div class="bc opacity15">?</div>
+        <div class="bc opacity15">?</div><div class="bc opacity15">?</div>
+        <div class="bc opacity15">?</div>
+        <div class="bc opacity15">?</div><div class="bc opacity15">?</div>
+        <div class="bc opacity15">?</div><div class="bc opacity15">?</div>
+        <div class="bc opacity15">?</div>
       </div>
     </div>
+  </div>
 
-    <!-- Status -->
-    <div id="status-banner" class="status-banner">
-      Tap Join to enter the next round
-    </div>
+  <div class="action-row">
+    <button id="join-btn"  class="btn-gold">🎮 Join Round — 50 coins</button>
+    <button id="bingo-btn" class="btn-green hidden">🎉 BINGO!</button>
+  </div>
+</section>
 
-    <!-- Fairness hash (shown during/after game) -->
-    <div id="hash-row" class="hash-row hidden">
-      🔐 Seed hash: <span id="seed-hash-display">--</span>
-    </div>
-
-    <!-- Called numbers -->
-    <div class="called-wrap">
-      <div class="called-label">Called numbers</div>
-      <div id="called-strip" class="called-strip"></div>
-    </div>
-
-    <!-- Bingo Card -->
-    <div class="bingo-card-wrap">
-      <div class="bingo-card">
-        <!-- Column headers -->
-        <div class="bingo-headers">
-          <div class="bingo-header">B</div>
-          <div class="bingo-header">I</div>
-          <div class="bingo-header">N</div>
-          <div class="bingo-header">G</div>
-          <div class="bingo-header">O</div>
-        </div>
-        <!-- 5×5 Grid — filled by app.js -->
-        <div id="bingo-grid" class="bingo-grid">
-          <!-- Placeholder skeleton before card is assigned -->
-          <div class="bingo-cell" style="opacity:0.15">?</div>
-          <div class="bingo-cell" style="opacity:0.15">?</div>
-          <div class="bingo-cell" style="opacity:0.15">?</div>
-          <div class="bingo-cell" style="opacity:0.15">?</div>
-          <div class="bingo-cell" style="opacity:0.15">?</div>
-          <div class="bingo-cell" style="opacity:0.15">?</div>
-          <div class="bingo-cell" style="opacity:0.15">?</div>
-          <div class="bingo-cell" style="opacity:0.15">?</div>
-          <div class="bingo-cell" style="opacity:0.15">?</div>
-          <div class="bingo-cell" style="opacity:0.15">?</div>
-          <div class="bingo-cell" style="opacity:0.15">?</div>
-          <div class="bingo-cell" style="opacity:0.15">?</div>
-          <div class="bingo-cell free marked">FREE</div>
-          <div class="bingo-cell" style="opacity:0.15">?</div>
-          <div class="bingo-cell" style="opacity:0.15">?</div>
-          <div class="bingo-cell" style="opacity:0.15">?</div>
-          <div class="bingo-cell" style="opacity:0.15">?</div>
-          <div class="bingo-cell" style="opacity:0.15">?</div>
-          <div class="bingo-cell" style="opacity:0.15">?</div>
-          <div class="bingo-cell" style="opacity:0.15">?</div>
-          <div class="bingo-cell" style="opacity:0.15">?</div>
-          <div class="bingo-cell" style="opacity:0.15">?</div>
-          <div class="bingo-cell" style="opacity:0.15">?</div>
-          <div class="bingo-cell" style="opacity:0.15">?</div>
-          <div class="bingo-cell" style="opacity:0.15">?</div>
-        </div>
+<!-- ═══════════ SLOT ═══════════ -->
+<section id="view-slot" class="view">
+  <div class="gtopbar">
+    <button id="back-slot" class="bk">←</button>
+    <div class="gtitle">🎰 Slot Game</div>
+    <div class="wallet-pill sm"><span>🎲</span><span id="balance-slot">--</span></div>
+  </div>
+  <div class="game-body">
+    <div class="slot-machine">
+      <div class="slot-screen">
+        <div class="reel-box" id="reel-0"><span id="sym-0">🎰</span></div>
+        <div class="reel-sep">|</div>
+        <div class="reel-box" id="reel-1"><span id="sym-1">🎰</span></div>
+        <div class="reel-sep">|</div>
+        <div class="reel-box" id="reel-2"><span id="sym-2">🎰</span></div>
       </div>
+      <div id="slot-msg" class="slot-msg">Spin to win!</div>
     </div>
+    <div class="paytable">
+      <div class="pt-title">PAY TABLE · 30 coins/spin</div>
+      <div class="pt-row"><span>🍋🍋🍋</span><span>×2</span></div>
+      <div class="pt-row"><span>🍊🍊🍊</span><span>×3</span></div>
+      <div class="pt-row"><span>🍇🍇🍇</span><span>×5</span></div>
+      <div class="pt-row"><span>🔔🔔🔔</span><span>×10</span></div>
+      <div class="pt-row"><span>💎💎💎</span><span>×20</span></div>
+      <div class="pt-row"><span>7️⃣7️⃣7️⃣</span><span>×50</span></div>
+      <div class="pt-row"><span>🍀🍀🍀</span><span>×30</span></div>
+      <div class="pt-row muted"><span>Any pair</span><span>×1–5</span></div>
+    </div>
+    <button id="spin-btn" class="btn-gold full">🎰 SPIN — 30 coins</button>
+  </div>
+</section>
 
-    <!-- Action buttons -->
+<!-- ═══════════ KENO ═══════════ -->
+<section id="view-keno" class="view">
+  <div class="gtopbar">
+    <button id="back-keno" class="bk">←</button>
+    <div class="gtitle">🎯 Keno</div>
+    <div class="wallet-pill sm"><span>🎲</span><span id="balance-keno">--</span></div>
+  </div>
+  <div class="game-body">
+    <div id="keno-status" class="status-banner">Pick 1–10 numbers then Play</div>
+    <div class="keno-info">
+      <span>Selected: <strong id="keno-count">0</strong>/10</span>
+      <span>Cost: 50 coins</span>
+    </div>
+    <div id="keno-grid" class="keno-grid"></div>
     <div class="action-row">
-      <button id="join-btn"  class="btn-join">🎮 Join Round — 50 coins</button>
-      <button id="bingo-btn" class="btn-bingo hidden">🎉 BINGO!</button>
+      <button id="keno-clear" class="btn-outline">Clear</button>
+      <button id="keno-play"  class="btn-gold">▶ Play — 50 coins</button>
     </div>
+    <div class="paytable">
+      <div class="pt-title">PAYOUTS (multiplier × wager)</div>
+      <div class="pt-row"><span>Pick 1 · match 1</span><span>×3</span></div>
+      <div class="pt-row"><span>Pick 3 · match 3</span><span>×8</span></div>
+      <div class="pt-row"><span>Pick 5 · match 5</span><span>×30</span></div>
+      <div class="pt-row"><span>Pick 7 · match 7</span><span>×100</span></div>
+      <div class="pt-row"><span>Pick 10 · match 10</span><span>×1000</span></div>
+    </div>
+  </div>
+</section>
 
-  </section>
+<!-- ═══════════ CARD ═══════════ -->
+<section id="view-card" class="view">
+  <div class="gtopbar">
+    <button id="back-card" class="bk">←</button>
+    <div class="gtitle">🃏 High / Low</div>
+    <div class="wallet-pill sm"><span>🎲</span><span id="balance-card">--</span></div>
+  </div>
+  <div class="game-body">
+    <div id="card-status" class="status-banner">Guess if the next card is Higher or Lower</div>
+    <div class="card-arena">
+      <div class="card-slot">
+        <div class="playing-card" id="current-card"><span id="card-val">?</span></div>
+        <div class="card-lbl">Current</div>
+      </div>
+      <div class="card-arrow">→</div>
+      <div class="card-slot">
+        <div class="playing-card hidden" id="next-card"><span id="next-val">?</span></div>
+        <div class="playing-card result-placeholder" id="card-placeholder">?</div>
+        <div class="card-lbl">Next</div>
+      </div>
+    </div>
+    <div id="card-result-msg" class="slot-msg"></div>
+    <div class="action-row" id="card-btns">
+      <button id="btn-low"  class="btn-outline big">⬇ Lower</button>
+      <button id="btn-high" class="btn-gold big">⬆ Higher</button>
+    </div>
+    <button id="btn-deal" class="btn-gold full hidden">🃏 New Card — 20 coins</button>
+    <div class="paytable">
+      <div class="pt-title">RULES · 20 coins/guess</div>
+      <div class="pt-row"><span>Correct guess</span><span>×2 (win 40)</span></div>
+      <div class="pt-row"><span>Wrong guess</span><span>Lose 20</span></div>
+      <div class="pt-row muted"><span>Same value = loss</span><span></span></div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════ HOW IT WORKS ═══════════ -->
+<section id="view-howto" class="view">
+  <div class="gtopbar">
+    <button id="back-howto" class="bk">←</button>
+    <div class="gtitle">⚡ How It Works</div>
+    <div style="width:40px"></div>
+  </div>
+  <div class="game-body">
+    <div class="howto-section">
+      <div class="howto-title">🎱 5×5 Bingo</div>
+      <div class="howto-step"><div class="hs-n">1</div><div><b>Join a Round</b> — Pay 50 coins. Each player gets a unique 5×5 card generated from a provably fair seed.</div></div>
+      <div class="howto-step"><div class="hs-n">2</div><div><b>Numbers Called</b> — Every 4 seconds a number 1–75 is called. The full board shows which are called.</div></div>
+      <div class="howto-step"><div class="hs-n">3</div><div><b>Mark Your Card</b> — Tap a number on your card when it's called. FREE centre is auto-marked.</div></div>
+      <div class="howto-step"><div class="hs-n">4</div><div><b>Shout BINGO!</b> — Complete a Row, Column, Diagonal, or Full House, then tap BINGO! to win the pot.</div></div>
+      <div class="howto-step"><div class="hs-n">5</div><div><b>Verify Fairness</b> — After the game the server reveals the seed. Anyone can verify the card and call order were not manipulated.</div></div>
+    </div>
+    <div class="howto-section">
+      <div class="howto-title">🎰 Slot Game</div>
+      <div class="howto-step"><div class="hs-n">1</div><div>Costs 30 coins per spin.</div></div>
+      <div class="howto-step"><div class="hs-n">2</div><div>Three reels spin. Match symbols to win!</div></div>
+      <div class="howto-step"><div class="hs-n">3</div><div>Triple 7️⃣ = ×50 jackpot!</div></div>
+    </div>
+    <div class="howto-section">
+      <div class="howto-title">🎯 Keno</div>
+      <div class="howto-step"><div class="hs-n">1</div><div>Pick 1–10 numbers from 1–80.</div></div>
+      <div class="howto-step"><div class="hs-n">2</div><div>Pay 50 coins. Server draws 20 random numbers.</div></div>
+      <div class="howto-step"><div class="hs-n">3</div><div>More matches = bigger payout (up to ×1000).</div></div>
+    </div>
+    <div class="howto-section">
+      <div class="howto-title">🃏 High / Low</div>
+      <div class="howto-step"><div class="hs-n">1</div><div>A card (1–13) is shown. Pay 20 coins.</div></div>
+      <div class="howto-step"><div class="hs-n">2</div><div>Guess if the NEXT card is Higher or Lower.</div></div>
+      <div class="howto-step"><div class="hs-n">3</div><div>Correct = win 40 coins. Wrong = lose 20.</div></div>
+    </div>
+    <div class="howto-section">
+      <div class="howto-title">💰 Coins &amp; ETB</div>
+      <div class="howto-step"><div class="hs-n">₿</div><div>1 coin = 0.10 ETB (Ethiopian Birr). New players start with 1,000 coins = 100 ETB.</div></div>
+    </div>
+  </div>
+</section>
 
 </div>
-
-<!-- Socket.IO from our own server (reliable, no CDN needed) -->
 <script src="/socket.io/socket.io.js"></script>
 <script src="app.js"></script>
 </body>
